@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.4.0
+// @version      0.4.1
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -26,7 +26,8 @@
         includeDraftHistory: false,
         completeInteractions: false,
     });
-    const RESOURCE_PAGE_SIZE = 100;
+    const OPEN_PAGE_SIZES = Object.freeze([100, 50, 25, 10]);
+    const HISTORY_PAGE_SIZES = Object.freeze([50, 25, 10]);
     const INTERACTION_PREVIEW_SIZE = 10;
     const DAY_MS = 24 * 60 * 60 * 1000;
     const HAN_PATTERN = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/u;
@@ -43,13 +44,14 @@
           $issueCursor: String
           $prStates: [PullRequestState!]!
           $issueStates: [IssueState!]!
+          $pageSize: Int!
           $fetchPulls: Boolean!
           $fetchIssues: Boolean!
           $includeDraftHistory: Boolean!
         ) {
           repository(owner: $owner, name: $name) {
             pullRequests(
-              first: ${RESOURCE_PAGE_SIZE}
+              first: $pageSize
               after: $prCursor
               states: $prStates
               orderBy: {field: CREATED_AT, direction: ASC}
@@ -109,7 +111,7 @@
               }
             }
             issues(
-              first: ${RESOURCE_PAGE_SIZE}
+              first: $pageSize
               after: $issueCursor
               states: $issueStates
               orderBy: {field: CREATED_AT, direction: ASC}
@@ -926,23 +928,23 @@
                             );
                         }
                         if (preview) details.push(`响应摘要：${preview}`);
-                        reject(
-                            new Error(
-                                `GitHub GraphQL 返回非 JSON；${details.join("；")}`,
-                            ),
+                        const error = new Error(
+                            `GitHub GraphQL 返回非 JSON；${details.join("；")}`,
                         );
+                        error.status = response.status;
+                        reject(error);
                         return;
                     }
                     if (response.status !== 200) {
-                        reject(
-                            new Error(
-                                formatApiError(
-                                    payload.message ||
-                                        `GitHub API 请求失败 (${response.status})`,
-                                    response,
-                                ),
+                        const error = new Error(
+                            formatApiError(
+                                payload.message ||
+                                    `GitHub API 请求失败 (${response.status})`,
+                                response,
                             ),
                         );
+                        error.status = response.status;
+                        reject(error);
                         return;
                     }
                     if (payload.errors?.length) {
@@ -1309,11 +1311,18 @@
         selectedScope,
         onProgress,
         requestedOptions = DEFAULT_OPTIONS,
+        startingRateLimits = null,
     ) {
         const selectedOptions = { ...DEFAULT_OPTIONS, ...requestedOptions };
+        const pageSizes =
+            selectedScope === "open" ? OPEN_PAGE_SIZES : HISTORY_PAGE_SIZES;
+        let pageSizeIndex = 0;
         const pullRequests = [];
         const issues = [];
-        const rateLimits = { graphql: null, rest: null };
+        const rateLimits = {
+            graphql: startingRateLimits?.graphql || null,
+            rest: startingRateLimits?.rest || null,
+        };
         const usage = {
             graphqlPoints: 0,
             graphqlRequests: 0,
@@ -1353,40 +1362,103 @@
                 );
             }
             const requestLabel = requestParts.join(" + ");
-            onProgress(
-                `准备请求 GraphQL ${requestLabel}；对象上限 ${RESOURCE_PAGE_SIZE}/页；每个互动连接上限 ${INTERACTION_PREVIEW_SIZE} 条元数据（不含正文）；Draft 时间线${selectedOptions.includeDraftHistory ? "开启" : "关闭"}`,
-                null,
-            );
-            const requestStartedAt = Date.now();
             let data;
-            try {
-                data = await requestGraphQL(REPOSITORY_QUERY, token, {
-                    owner: repository.owner,
-                    name: repository.name,
-                    prCursor,
-                    issueCursor,
-                    prStates:
-                        selectedScope === "open"
-                            ? ["OPEN"]
-                            : ["OPEN", "CLOSED", "MERGED"],
-                    issueStates:
-                        selectedScope === "open"
-                            ? ["OPEN"]
-                            : ["OPEN", "CLOSED"],
-                    fetchPulls: requestPulls,
-                    fetchIssues: requestIssues,
-                    includeDraftHistory: selectedOptions.includeDraftHistory,
-                });
-            } catch (error) {
-                const seconds = (
-                    (Date.now() - requestStartedAt) /
-                    1000
-                ).toFixed(1);
-                throw new Error(
-                    `GraphQL ${requestLabel}失败；耗时 ${seconds} 秒；未自动重试，以避免失败请求重复消耗额度；${error.message || String(error)}`,
+            let pageSize;
+            let requestSeconds;
+            while (true) {
+                pageSize = pageSizes[pageSizeIndex];
+                onProgress(
+                    `准备请求 GraphQL ${requestLabel}；对象上限 ${pageSize}/页；每个互动连接上限 ${INTERACTION_PREVIEW_SIZE} 条元数据（不含正文）；Draft 时间线${selectedOptions.includeDraftHistory ? "开启" : "关闭"}`,
+                    null,
                 );
+                const requestStartedAt = Date.now();
+                try {
+                    data = await requestGraphQL(REPOSITORY_QUERY, token, {
+                        owner: repository.owner,
+                        name: repository.name,
+                        prCursor,
+                        issueCursor,
+                        prStates:
+                            selectedScope === "open"
+                                ? ["OPEN"]
+                                : ["OPEN", "CLOSED", "MERGED"],
+                        issueStates:
+                            selectedScope === "open"
+                                ? ["OPEN"]
+                                : ["OPEN", "CLOSED"],
+                        pageSize,
+                        fetchPulls: requestPulls,
+                        fetchIssues: requestIssues,
+                        includeDraftHistory:
+                            selectedOptions.includeDraftHistory,
+                    });
+                    requestSeconds = (
+                        (Date.now() - requestStartedAt) /
+                        1000
+                    ).toFixed(1);
+                    break;
+                } catch (error) {
+                    const seconds = (
+                        (Date.now() - requestStartedAt) /
+                        1000
+                    ).toFixed(1);
+                    const failure = `GraphQL ${requestLabel}失败；对象上限 ${pageSize}/页；耗时 ${seconds} 秒`;
+                    const nextPageSize = pageSizes[pageSizeIndex + 1];
+                    if (error.status !== 502 || !nextPageSize) {
+                        const reason =
+                            error.status === 502
+                                ? `已到最小对象上限 ${pageSize}/页`
+                                : "仅对 HTTP 502 执行安全降级";
+                        throw new Error(
+                            `${failure}；未自动重试：${reason}；${error.message || String(error)}`,
+                        );
+                    }
+
+                    const beforeFailure = rateLimits.graphql;
+                    if (!beforeFailure) {
+                        throw new Error(
+                            `${failure}；未自动重试：缺少失败前 GraphQL 额度基线，无法证明失败请求未扣点；${error.message || String(error)}`,
+                        );
+                    }
+
+                    let checkedRateLimits;
+                    try {
+                        checkedRateLimits = await fetchRateLimits(token);
+                    } catch (quotaError) {
+                        throw new Error(
+                            `${failure}；额度复核失败，未自动重试：${quotaError.message || String(quotaError)}；原始错误：${error.message || String(error)}`,
+                        );
+                    }
+                    rateLimits.rest =
+                        checkedRateLimits.rest || rateLimits.rest;
+                    rateLimits.graphql =
+                        checkedRateLimits.graphql || rateLimits.graphql;
+                    const afterFailure = checkedRateLimits.graphql;
+                    let unsafeReason = "";
+                    if (!afterFailure) {
+                        unsafeReason = "额度查询未返回 GraphQL 数据";
+                    } else if (
+                        beforeFailure.resetAt !== afterFailure.resetAt
+                    ) {
+                        unsafeReason =
+                            "GraphQL 额度窗口已重置，无法证明失败请求未扣点";
+                    } else if (beforeFailure.used !== afterFailure.used) {
+                        unsafeReason = `GraphQL 已用额度从 ${beforeFailure.used} 变为 ${afterFailure.used}，失败请求可能已扣点`;
+                    }
+                    if (unsafeReason) {
+                        throw new Error(
+                            `${failure}；未自动重试：${unsafeReason}；${error.message || String(error)}`,
+                        );
+                    }
+
+                    onProgress(
+                        `${failure}；/rate_limit 确认 GraphQL 已用额度仍为 ${afterFailure.used}/${afterFailure.limit}，失败请求未扣点；对象上限 ${pageSize} → ${nextPageSize}/页后自动重试`,
+                        afterFailure,
+                    );
+                    pageSizeIndex += 1;
+                }
             }
-            if (!data.repository) {
+            if (!data?.repository) {
                 throw new Error("仓库不存在，或 Token 没有读取权限");
             }
             if (requestPulls) {
@@ -1424,7 +1496,7 @@
                 progress.push(`Issue ${issues.length}/${issueTotal ?? "?"}`);
             }
             onProgress(
-                `GraphQL 第 ${page} 次请求完成；${progress.join("，")}；cost ${rateLimit.cost}；耗时 ${((Date.now() - requestStartedAt) / 1000).toFixed(1)} 秒`,
+                `GraphQL 第 ${page} 次请求完成；对象上限 ${pageSize}/页；${progress.join("，")}；cost ${rateLimit.cost}；耗时 ${requestSeconds} 秒`,
                 rateLimit,
             );
         }
@@ -1623,7 +1695,7 @@
         const costOptions = selectedOptions();
         const draftEstimate = Math.max(
             1,
-            Math.ceil(prCount / RESOURCE_PAGE_SIZE),
+            Math.ceil(prCount / HISTORY_PAGE_SIZES[0]),
         );
         const rows = [
             [
@@ -2318,8 +2390,8 @@
         const requestedOptions = selectedOptions();
         const graphQlStrategy =
             requestedScope === "open"
-                ? "合并 PR/Issue GraphQL 分页"
-                : `PR/Issue 分离 GraphQL 分页（每页 ${RESOURCE_PAGE_SIZE}）`;
+                ? `合并 PR/Issue GraphQL 自适应分页（${OPEN_PAGE_SIZES.join("→")}/页）`
+                : `PR/Issue 分离 GraphQL 自适应分页（${HISTORY_PAGE_SIZES.join("→")}/页）`;
         const strategy = `${graphQlStrategy} + 单次 Commit 统计${
             requestedOptions.completeInteractions
                 ? " + 完整互动 REST"
@@ -2374,6 +2446,7 @@
                     );
                 },
                 requestedOptions,
+                baselineRateLimits,
             );
             analysis = result;
             analyzedScope = requestedScope;

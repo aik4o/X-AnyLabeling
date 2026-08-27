@@ -154,6 +154,7 @@ async function testAllHistorySplitsPullsAndIssues() {
         requests.push({
             fetchPulls: variables.fetchPulls,
             fetchIssues: variables.fetchIssues,
+            pageSize: variables.pageSize,
             query: payload.query,
         });
         const repository = {};
@@ -203,17 +204,18 @@ async function testAllHistorySplitsPullsAndIssues() {
     );
 
     assert.deepEqual(
-        requests.map(({ fetchPulls, fetchIssues }) => ({
+        requests.map(({ fetchPulls, fetchIssues, pageSize }) => ({
             fetchPulls,
             fetchIssues,
+            pageSize,
         })),
         [
-            { fetchPulls: true, fetchIssues: false },
-            { fetchPulls: false, fetchIssues: true },
+            { fetchPulls: true, fetchIssues: false, pageSize: 50 },
+            { fetchPulls: false, fetchIssues: true, pageSize: 50 },
         ],
     );
     assert.match(requests[0].query, /comments\(first: 10\)/);
-    assert.match(requests[0].query, /pullRequests\(\s+first: 100/);
+    assert.match(requests[0].query, /pullRequests\(\s+first: \$pageSize/);
     assert.doesNotMatch(requests[0].query, /id url/);
 
     requests.length = 0;
@@ -230,17 +232,44 @@ async function testAllHistorySplitsPullsAndIssues() {
         },
     );
     assert.deepEqual(
-        requests.map(({ fetchPulls, fetchIssues }) => ({
+        requests.map(({ fetchPulls, fetchIssues, pageSize }) => ({
             fetchPulls,
             fetchIssues,
+            pageSize,
         })),
-        [{ fetchPulls: true, fetchIssues: true }],
+        [{ fetchPulls: true, fetchIssues: true, pageSize: 100 }],
     );
 }
 
 async function testGraphqlErrorDetails() {
     const logs = [];
-    global.GM_xmlhttpRequest = ({ onload }) => {
+    let graphqlRequests = 0;
+    const previousReset = 1773104400;
+    global.GM_xmlhttpRequest = ({ url, onload }) => {
+        if (url === "https://api.github.com/rate_limit") {
+            onload({
+                status: 200,
+                responseHeaders: "",
+                responseText: JSON.stringify({
+                    resources: {
+                        core: {
+                            limit: 5000,
+                            used: 0,
+                            remaining: 5000,
+                            reset: previousReset + 3600,
+                        },
+                        graphql: {
+                            limit: 5000,
+                            used: 0,
+                            remaining: 5000,
+                            reset: previousReset + 3600,
+                        },
+                    },
+                }),
+            });
+            return;
+        }
+        graphqlRequests += 1;
         onload({
             status: 502,
             statusText: "Bad Gateway",
@@ -262,6 +291,16 @@ async function testGraphqlErrorDetails() {
                 includeDraftHistory: false,
                 completeInteractions: false,
             },
+            {
+                rest: null,
+                graphql: {
+                    limit: 5000,
+                    used: 60,
+                    remaining: 4940,
+                    resetAt: new Date(previousReset * 1000).toISOString(),
+                    resource: "graphql",
+                },
+            },
         ),
         (error) => {
             assert.match(error.message, /PR 第 1 页.*耗时/);
@@ -270,10 +309,110 @@ async function testGraphqlErrorDetails() {
             assert.match(error.message, /GitHub Request ID TEST:123/);
             assert.match(error.message, /已用 60\/5000/);
             assert.match(error.message, /响应摘要：upstream failure/);
+            assert.match(error.message, /额度窗口已重置.*无法证明/);
             return true;
         },
     );
-    assert.match(logs[0], /对象上限 100\/页.*互动连接上限 10 条元数据/);
+    assert.equal(graphqlRequests, 1);
+    assert.match(logs[0], /对象上限 50\/页.*互动连接上限 10 条元数据/);
+}
+
+async function testSafeGraphqlPageFallback() {
+    const logs = [];
+    const pageSizes = [];
+    const reset = 1773104400;
+    const resetAt = new Date(reset * 1000).toISOString();
+    global.GM_xmlhttpRequest = ({ url, data, onload }) => {
+        if (url === "https://api.github.com/rate_limit") {
+            onload({
+                status: 200,
+                responseHeaders: "",
+                responseText: JSON.stringify({
+                    resources: {
+                        core: {
+                            limit: 5000,
+                            used: 0,
+                            remaining: 5000,
+                            reset,
+                        },
+                        graphql: {
+                            limit: 5000,
+                            used: 100,
+                            remaining: 4900,
+                            reset,
+                        },
+                    },
+                }),
+            });
+            return;
+        }
+
+        const variables = JSON.parse(data).variables;
+        pageSizes.push(variables.pageSize);
+        if (pageSizes.length === 1) {
+            onload({
+                status: 502,
+                statusText: "Bad Gateway",
+                responseHeaders: "content-type: text/html\r\n",
+                responseText: "<html>upstream failure</html>",
+            });
+            return;
+        }
+        onload({
+            status: 200,
+            responseHeaders: "",
+            responseText: JSON.stringify({
+                data: {
+                    repository: {
+                        pullRequests: {
+                            totalCount: 0,
+                            nodes: [],
+                            pageInfo: {
+                                hasNextPage: false,
+                                endCursor: null,
+                            },
+                        },
+                    },
+                    rateLimit: {
+                        cost: 1,
+                        limit: 5000,
+                        remaining: 4899,
+                        resetAt,
+                        used: 101,
+                    },
+                },
+            }),
+        });
+    };
+
+    const result = await stats.fetchPullRequests(
+        { owner: "o", name: "r" },
+        "token",
+        "all",
+        (message) => logs.push(message),
+        {
+            includeIssues: false,
+            includeCommits: false,
+            includeDraftHistory: false,
+            completeInteractions: false,
+        },
+        {
+            rest: null,
+            graphql: {
+                limit: 5000,
+                used: 100,
+                remaining: 4900,
+                resetAt,
+                resource: "graphql",
+            },
+        },
+    );
+
+    assert.deepEqual(pageSizes, [50, 25]);
+    assert.equal(result.usage.graphqlRequests, 1);
+    assert.equal(result.usage.graphqlPoints, 1);
+    assert.match(logs.join("\n"), /失败请求未扣点/);
+    assert.match(logs.join("\n"), /对象上限 50 → 25\/页后自动重试/);
 }
 
 async function testRateLimitLookup() {
@@ -323,6 +462,7 @@ async function testRateLimitLookup() {
 
 testAllHistorySplitsPullsAndIssues()
     .then(testGraphqlErrorDetails)
+    .then(testSafeGraphqlPageFallback)
     .then(testRateLimitLookup)
     .then(() => console.log("github_pr_statistics tests passed"))
     .catch((error) => {
