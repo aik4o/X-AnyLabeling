@@ -2,7 +2,7 @@
 // @name         GitHub PR 中英文统计
 // @name:en      GitHub PR Language Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.1.3
+// @version      0.2.0
 // @description  统计仓库中英文 PR 的合并率、提交者/维护者回复率和维护者最近回复时间
 // @description:en Analyze PR language, merge rate, reply rate, and latest maintainer reply
 // @match        https://github.com/*/*
@@ -25,13 +25,62 @@
         "MEMBER",
         "COLLABORATOR",
     ]);
-    const QUERY = `
-        query($owner: String!, $name: String!, $states: [PullRequestState!], $cursor: String) {
+    const OPEN_COUNT_QUERY = `
+        query($owner: String!, $name: String!) {
+          repository(owner: $owner, name: $name) {
+            pullRequests(first: 1, states: [OPEN]) { totalCount }
+          }
+          rateLimit { cost limit remaining resetAt used }
+        }
+    `;
+    const HISTORY_QUERY = `
+        query($owner: String!, $name: String!, $cursor: String, $pageSize: Int!) {
           repository(owner: $owner, name: $name) {
             pullRequests(
-              first: 100
+              first: $pageSize
               after: $cursor
-              states: $states
+              states: [OPEN, CLOSED, MERGED]
+              orderBy: {field: CREATED_AT, direction: ASC}
+            ) {
+              totalCount
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                number
+                title
+                body
+                url
+                state
+                mergedAt
+                author { login }
+                comments(first: 100) {
+                  pageInfo { hasNextPage }
+                  nodes {
+                    author { login }
+                    authorAssociation
+                    createdAt
+                  }
+                }
+                reviews(first: 100) {
+                  pageInfo { hasNextPage }
+                  nodes {
+                    author { login }
+                    authorAssociation
+                    submittedAt
+                  }
+                }
+              }
+            }
+          }
+          rateLimit { cost limit remaining resetAt used }
+        }
+    `;
+    const OPEN_INTERACTIONS_QUERY = `
+        query($owner: String!, $name: String!, $cursor: String, $pageSize: Int!) {
+          repository(owner: $owner, name: $name) {
+            pullRequests(
+              first: $pageSize
+              after: $cursor
+              states: [OPEN]
               orderBy: {field: CREATED_AT, direction: ASC}
             ) {
               pageInfo { hasNextPage endCursor }
@@ -85,7 +134,8 @@
     let scope = "open";
     let analyzedScope = null;
     let loading = false;
-    let lastRateLimit = null;
+    let lastRateLimits = { graphql: null, rest: null };
+    let lastUsage = { graphqlPoints: 0, restRequests: 0 };
     let overflowPrs = [];
 
     function classifyLanguage(title, body) {
@@ -109,9 +159,12 @@
 
     function analyzePullRequest(pr) {
         const author = pr.author?.login || "";
-        const threadComments = (pr.reviewThreads?.nodes || []).flatMap(
-            (thread) => thread.comments?.nodes || [],
-        );
+        const threadComments = [
+            ...(pr.reviewComments || []),
+            ...(pr.reviewThreads?.nodes || []).flatMap(
+                (thread) => thread.comments?.nodes || [],
+            ),
+        ];
         const events = [
             ...(pr.comments?.nodes || []).map((event) => ({
                 login: event.author?.login || "",
@@ -189,7 +242,13 @@
     }
 
     function formatRateLimit(value) {
-        return `API 额度：已用 ${value.used}/${value.limit}（剩余 ${value.remaining}）`;
+        const name =
+            value.resource === "graphql"
+                ? "GraphQL"
+                : value.resource === "core"
+                  ? "REST"
+                  : "API";
+        return `${name} 额度：已用 ${value.used}/${value.limit}（剩余 ${value.remaining}）`;
     }
 
     function rateLimitFromHeaders(rawHeaders) {
@@ -204,12 +263,34 @@
         const used = readNumber("x-ratelimit-used");
         const reset = readNumber("x-ratelimit-reset");
         if ([limit, remaining, used, reset].includes(null)) return null;
+        const resource = String(rawHeaders || "").match(
+            /^x-ratelimit-resource:\s*(\S+)\s*$/im,
+        )?.[1];
         return {
             limit,
             remaining,
+            resource: resource?.toLowerCase() || "",
             used,
             resetAt: new Date(reset * 1000).toISOString(),
         };
+    }
+
+    function rememberRateLimit(value) {
+        if (!value) return;
+        const key = value.resource === "graphql" ? "graphql" : "rest";
+        lastRateLimits[key] = value;
+    }
+
+    function formatRateLimits() {
+        return [lastRateLimits.rest, lastRateLimits.graphql]
+            .filter(Boolean)
+            .map(
+                (value) =>
+                    `${formatRateLimit(value)}，重置时间 ${formatDate(
+                        value.resetAt,
+                    )}`,
+            )
+            .join("；");
     }
 
     function formatApiError(message, response) {
@@ -232,7 +313,7 @@
         return { owner: parts[0], name: parts[1] };
     }
 
-    function requestGraphQL(token, variables) {
+    function requestGraphQL(query, token, variables) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: "POST",
@@ -242,7 +323,7 @@
                     Authorization: `Bearer ${token}`,
                     "Content-Type": "application/json",
                 },
-                data: JSON.stringify({ query: QUERY, variables }),
+                data: JSON.stringify({ query, variables }),
                 timeout: 30000,
                 onload(response) {
                     let payload;
@@ -289,6 +370,93 @@
         });
     }
 
+    function requestRest(token, url) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "GET",
+                url,
+                headers: {
+                    Accept: "application/vnd.github+json",
+                    Authorization: `Bearer ${token}`,
+                },
+                timeout: 30000,
+                onload(response) {
+                    let payload;
+                    try {
+                        payload = JSON.parse(response.responseText);
+                    } catch (_error) {
+                        reject(new Error("GitHub REST API 返回了无法解析的数据"));
+                        return;
+                    }
+                    if (response.status !== 200) {
+                        reject(
+                            new Error(
+                                formatApiError(
+                                    payload.message ||
+                                        `GitHub REST API 请求失败 (${response.status})`,
+                                    response,
+                                ),
+                            ),
+                        );
+                        return;
+                    }
+                    if (!Array.isArray(payload)) {
+                        reject(new Error("GitHub REST API 返回了意外的数据结构"));
+                        return;
+                    }
+                    resolve({
+                        items: payload,
+                        hasNextPage: /<[^>]+>;\s*rel="next"/i.test(
+                            response.responseHeaders || "",
+                        ),
+                        rateLimit: rateLimitFromHeaders(
+                            response.responseHeaders,
+                        ),
+                    });
+                },
+                onerror() {
+                    reject(new Error("无法连接 GitHub REST API"));
+                },
+                ontimeout() {
+                    reject(new Error("GitHub REST API 请求超时"));
+                },
+            });
+        });
+    }
+
+    async function fetchRestPages(url, token, onPage) {
+        let page = 1;
+        let total = 0;
+        let hasNextPage = true;
+        let rateLimit = null;
+        while (hasNextPage) {
+            const separator = url.includes("?") ? "&" : "?";
+            const result = await requestRest(
+                token,
+                `${url}${separator}page=${page}`,
+            );
+            total += result.items.length;
+            rateLimit = result.rateLimit;
+            onPage(result.items, page, total, rateLimit);
+            hasNextPage = result.hasNextPage;
+            page += 1;
+        }
+        return { total, rateLimit };
+    }
+
+    function normalizeRestComment(comment) {
+        return {
+            author: { login: comment.user?.login || "" },
+            authorAssociation: comment.author_association,
+            createdAt: comment.created_at,
+        };
+    }
+
+    function pullNumberFromUrl(url) {
+        const number = Number(String(url || "").split("/").pop());
+        return Number.isInteger(number) ? number : null;
+    }
+
     function hasNestedOverflow(pr) {
         return (
             pr.comments?.pageInfo?.hasNextPage ||
@@ -307,42 +475,113 @@
         onProgress,
     ) {
         const pullRequests = [];
-        const overflow = [];
-        let cursor = null;
-        let page = 0;
-        let hasNextPage = true;
-        let rateLimit;
+        const overflow = new Set();
+        const rateLimits = { graphql: null, rest: null };
+        const usage = { graphqlPoints: 0, restRequests: 0 };
+        const includeThreads = selectedScope === "open";
+        let totalCount = null;
+        if (includeThreads) {
+            const countData = await requestGraphQL(
+                OPEN_COUNT_QUERY,
+                token,
+                repository,
+            );
+            if (!countData.repository) {
+                throw new Error("仓库不存在，或 Token 没有读取权限");
+            }
+            totalCount = countData.repository.pullRequests.totalCount;
+            const rateLimit = {
+                ...countData.rateLimit,
+                resource: "graphql",
+            };
+            usage.graphqlPoints += rateLimit.cost;
+            rateLimits.graphql = rateLimit;
+            onProgress(
+                `GraphQL Open PR 数量查询完成；共 ${totalCount} 个；cost ${rateLimit.cost}`,
+                rateLimit,
+            );
+        }
 
-        while (hasNextPage) {
-            const data = await requestGraphQL(token, {
-                owner: repository.owner,
-                name: repository.name,
-                states: selectedScope === "open" ? ["OPEN"] : null,
-                cursor,
-            });
+        let cursor = null;
+        let hasNextPage = true;
+        let page = 0;
+        while (
+            hasNextPage &&
+            (totalCount === null || pullRequests.length < totalCount)
+        ) {
+            const pageSize =
+                totalCount === null
+                    ? 100
+                    : Math.min(100, totalCount - pullRequests.length);
+            const data = await requestGraphQL(
+                includeThreads ? OPEN_INTERACTIONS_QUERY : HISTORY_QUERY,
+                token,
+                {
+                    owner: repository.owner,
+                    name: repository.name,
+                    cursor,
+                    pageSize,
+                },
+            );
             if (!data.repository) {
                 throw new Error("仓库不存在，或 Token 没有读取权限");
             }
             const connection = data.repository.pullRequests;
-            pullRequests.push(...connection.nodes);
-            overflow.push(
-                ...connection.nodes
-                    .filter(hasNestedOverflow)
-                    .map((pr) => pr.number),
-            );
-            hasNextPage = connection.pageInfo.hasNextPage;
+            if (totalCount === null) totalCount = connection.totalCount;
+            for (const node of connection.nodes) {
+                node.reviewComments = [];
+                pullRequests.push(node);
+                if (hasNestedOverflow(node)) overflow.add(node.number);
+            }
             cursor = connection.pageInfo.endCursor;
-            rateLimit = data.rateLimit;
+            hasNextPage = connection.pageInfo.hasNextPage;
             page += 1;
-            onProgress(pullRequests.length, page, rateLimit);
+            const rateLimit = { ...data.rateLimit, resource: "graphql" };
+            usage.graphqlPoints += rateLimit.cost;
+            rateLimits.graphql = rateLimit;
+            onProgress(
+                `GraphQL ${includeThreads ? "Open 完整互动" : "历史评论/Review"}第 ${page} 页完成；累计 ${pullRequests.length}/${totalCount} 个 PR；本页 ${pageSize} 个；cost ${rateLimit.cost}`,
+                rateLimit,
+            );
         }
 
-        // ponytail: review threads are capped at 40 and other discussions at
-        // 100 so a 100-PR page stays within GitHub's GraphQL query limits.
+        if (!includeThreads && pullRequests.length) {
+            const byNumber = new Map(
+                pullRequests.map((pr) => [pr.number, pr]),
+            );
+            const owner = encodeURIComponent(repository.owner);
+            const name = encodeURIComponent(repository.name);
+            await fetchRestPages(
+                `https://api.github.com/repos/${owner}/${name}/pulls/comments?sort=created&direction=asc&per_page=100`,
+                token,
+                (items, page, total, rateLimit) => {
+                    usage.restRequests += 1;
+                    for (const comment of items) {
+                        const pr = byNumber.get(
+                            pullNumberFromUrl(comment.pull_request_url),
+                        );
+                        if (pr) {
+                            pr.reviewComments.push(
+                                normalizeRestComment(comment),
+                            );
+                        }
+                    }
+                    rateLimits.rest = rateLimit;
+                    onProgress(
+                        `REST 行内 review 评论第 ${page} 页完成；累计 ${total} 条`,
+                        rateLimit,
+                    );
+                },
+            );
+        }
+
+        // ponytail: only repository-wide inline comments use REST. Ordinary
+        // comments/reviews stay capped at 100 per PR and Open threads at 40.
         return {
             rows: pullRequests.map(analyzePullRequest),
-            overflow,
-            rateLimit,
+            overflow: [...overflow].sort((a, b) => a - b),
+            rateLimits,
+            usage,
         };
     }
 
@@ -536,13 +775,11 @@
         const warning = overflowPrs.length
             ? `；PR #${overflowPrs.join(", #")} 的讨论数据超过单次检索上限，回复统计为下限`
             : "";
-        const rateLimit = lastRateLimit
-            ? `；${formatRateLimit(lastRateLimit)}，重置时间 ${formatDate(
-                  lastRateLimit.resetAt,
-              )}`
-            : "";
+        const quotas = formatRateLimits();
+        const rateLimit = quotas ? `；${quotas}` : "";
+        const usage = `；本次消耗 GraphQL ${lastUsage.graphqlPoints} points，REST ${lastUsage.restRequests} 次请求`;
         setStatus(
-            `已分析 ${analyzedRows.length} 个 PR；当前显示 ${total} 个${warning}${rateLimit}`,
+            `已分析 ${analyzedRows.length} 个 PR；当前显示 ${total} 个${warning}${usage}${rateLimit}`,
             "success",
         );
     }
@@ -575,30 +812,41 @@
         }
 
         const requestedScope = scope;
+        const strategy =
+            requestedScope === "open"
+                ? "GraphQL 动态页大小完整互动"
+                : "低成本 GraphQL 历史 + REST 行内评论";
+        lastRateLimits = { graphql: null, rest: null };
+        lastUsage = { graphqlPoints: 0, restRequests: 0 };
         setLoading(true);
         ui.cards.innerHTML = "";
         ui.table.innerHTML = "";
         setStatus(
             `开始分析 ${currentRepository.owner}/${currentRepository.name}；范围：${
                 requestedScope === "open" ? "仅 Open" : "全部 PR"
-            }；PR 每页 100 个`,
+            }；低额度策略：${strategy}`,
         );
         try {
             const result = await fetchPullRequests(
                 currentRepository,
                 token,
                 requestedScope,
-                (count, page, rateLimit) => {
-                    lastRateLimit = rateLimit;
+                (message, rateLimit) => {
+                    rememberRateLimit(rateLimit);
                     setStatus(
-                        `第 ${page} 页完成；累计 ${count} 个 PR；本页 cost ${rateLimit.cost}；${formatRateLimit(rateLimit)}`,
+                        `${message}${
+                            rateLimit
+                                ? `；${formatRateLimit(rateLimit)}`
+                                : ""
+                        }`,
                     );
                 },
             );
             analyzedRows = result.rows;
             analyzedScope = requestedScope;
             overflowPrs = result.overflow;
-            lastRateLimit = result.rateLimit;
+            lastRateLimits = result.rateLimits;
+            lastUsage = result.usage;
             render();
         } catch (error) {
             setStatus(error.message || String(error), "error");
@@ -772,7 +1020,7 @@
                   <button id="clear-token" class="button">清除 Token</button>
                 </div>
                 <p class="help">
-                  GraphQL API 必须使用 Token。建议使用仅含仓库元数据和 Pull requests 只读权限的 fine-grained token。
+                  GitHub REST/GraphQL API 使用同一个 Token。建议使用仅含仓库元数据和 Pull requests 只读权限的 fine-grained token。
                   Token 只保存在油猴扩展存储中，不会写入页面或仓库。
                 </p>
               </details>
@@ -862,7 +1110,8 @@
             analyzedRows = null;
             analyzedScope = null;
             overflowPrs = [];
-            lastRateLimit = null;
+            lastRateLimits = { graphql: null, rest: null };
+            lastUsage = { graphqlPoints: 0, restRequests: 0 };
             ui.log.textContent = "";
             ui.cards.innerHTML = "";
             ui.table.innerHTML = "";
@@ -874,7 +1123,10 @@
         module.exports = {
             analyzePullRequest,
             classifyLanguage,
+            fetchPullRequests,
             formatRateLimit,
+            normalizeRestComment,
+            pullNumberFromUrl,
             rate,
             rateLimitFromHeaders,
             summarize,
