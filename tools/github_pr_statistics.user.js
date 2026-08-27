@@ -2,7 +2,7 @@
 // @name         GitHub PR 中英文统计
 // @name:en      GitHub PR Language Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.1.2
+// @version      0.1.3
 // @description  统计仓库中英文 PR 的合并率、提交者/维护者回复率和维护者最近回复时间
 // @description:en Analyze PR language, merge rate, reply rate, and latest maintainer reply
 // @match        https://github.com/*/*
@@ -75,7 +75,7 @@
               }
             }
           }
-          rateLimit { cost remaining resetAt }
+          rateLimit { cost limit remaining resetAt used }
         }
     `;
 
@@ -188,6 +188,39 @@
             : "—";
     }
 
+    function formatRateLimit(value) {
+        return `API 额度：已用 ${value.used}/${value.limit}（剩余 ${value.remaining}）`;
+    }
+
+    function rateLimitFromHeaders(rawHeaders) {
+        const readNumber = (name) => {
+            const match = String(rawHeaders || "").match(
+                new RegExp(`^${name}:\\s*(\\d+)\\s*$`, "im"),
+            );
+            return match ? Number(match[1]) : null;
+        };
+        const limit = readNumber("x-ratelimit-limit");
+        const remaining = readNumber("x-ratelimit-remaining");
+        const used = readNumber("x-ratelimit-used");
+        const reset = readNumber("x-ratelimit-reset");
+        if ([limit, remaining, used, reset].includes(null)) return null;
+        return {
+            limit,
+            remaining,
+            used,
+            resetAt: new Date(reset * 1000).toISOString(),
+        };
+    }
+
+    function formatApiError(message, response) {
+        const rateLimit = rateLimitFromHeaders(response.responseHeaders);
+        return rateLimit
+            ? `${message}；${formatRateLimit(rateLimit)}，重置时间 ${formatDate(
+                  rateLimit.resetAt,
+              )}`
+            : message;
+    }
+
     function parseRepository() {
         const parts = location.pathname.split("/").filter(Boolean);
         if (
@@ -222,8 +255,11 @@
                     if (response.status !== 200) {
                         reject(
                             new Error(
-                                payload.message ||
-                                    `GitHub API 请求失败 (${response.status})`,
+                                formatApiError(
+                                    payload.message ||
+                                        `GitHub API 请求失败 (${response.status})`,
+                                    response,
+                                ),
                             ),
                         );
                         return;
@@ -231,9 +267,12 @@
                     if (payload.errors?.length) {
                         reject(
                             new Error(
-                                payload.errors
-                                    .map((error) => error.message)
-                                    .join("；"),
+                                formatApiError(
+                                    payload.errors
+                                        .map((error) => error.message)
+                                        .join("；"),
+                                    response,
+                                ),
                             ),
                         );
                         return;
@@ -498,7 +537,7 @@
             ? `；PR #${overflowPrs.join(", #")} 的讨论数据超过单次检索上限，回复统计为下限`
             : "";
         const rateLimit = lastRateLimit
-            ? `；API 剩余 ${lastRateLimit.remaining}，重置时间 ${formatDate(
+            ? `；${formatRateLimit(lastRateLimit)}，重置时间 ${formatDate(
                   lastRateLimit.resetAt,
               )}`
             : "";
@@ -552,7 +591,7 @@
                 (count, page, rateLimit) => {
                     lastRateLimit = rateLimit;
                     setStatus(
-                        `第 ${page} 页完成；累计 ${count} 个 PR；本页 cost ${rateLimit.cost}；API 剩余 ${rateLimit.remaining}`,
+                        `第 ${page} 页完成；累计 ${count} 个 PR；本页 cost ${rateLimit.cost}；${formatRateLimit(rateLimit)}`,
                     );
                 },
             );
@@ -835,7 +874,9 @@
         module.exports = {
             analyzePullRequest,
             classifyLanguage,
+            formatRateLimit,
             rate,
+            rateLimitFromHeaders,
             summarize,
         };
         return;
