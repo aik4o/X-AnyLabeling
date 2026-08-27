@@ -264,8 +264,54 @@ async function testGraphqlErrorDetails() {
     assert.match(logs[0], /对象上限 100\/页.*互动连接上限 20 条/);
 }
 
+async function testRateLimitLookup() {
+    global.GM_xmlhttpRequest = ({ method, url, onload }) => {
+        assert.equal(method, "GET");
+        assert.equal(url, "https://api.github.com/rate_limit");
+        onload({
+            status: 200,
+            responseHeaders: "",
+            responseText: JSON.stringify({
+                resources: {
+                    core: {
+                        limit: 5000,
+                        used: 18,
+                        remaining: 4982,
+                        reset: 1773104400,
+                    },
+                    graphql: {
+                        limit: 5000,
+                        used: 531,
+                        remaining: 4469,
+                        reset: 1773104400,
+                    },
+                },
+            }),
+        });
+    };
+
+    const rateLimits = await stats.fetchRateLimits("token");
+    assert.equal(rateLimits.rest.used, 18);
+    assert.equal(rateLimits.graphql.remaining, 4469);
+    assert.equal(rateLimits.graphql.resource, "graphql");
+    assert.equal(
+        stats.formatRateLimitChange(
+            {
+                rest: { used: 18, resetAt: rateLimits.rest.resetAt },
+                graphql: {
+                    used: 471,
+                    resetAt: rateLimits.graphql.resetAt,
+                },
+            },
+            rateLimits,
+        ),
+        "分析期间额度变化：REST +0，GraphQL +60",
+    );
+}
+
 testAllHistorySplitsPullsAndIssues()
     .then(testGraphqlErrorDetails)
+    .then(testRateLimitLookup)
     .then(() => console.log("github_pr_statistics tests passed"))
     .catch((error) => {
         console.error(error);

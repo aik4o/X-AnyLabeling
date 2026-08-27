@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.3.2
+// @version      0.3.3
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -810,8 +810,8 @@
         lastRateLimits[key] = value;
     }
 
-    function formatRateLimits() {
-        return [lastRateLimits.rest, lastRateLimits.graphql]
+    function formatRateLimits(rateLimits = lastRateLimits) {
+        return [rateLimits.rest, rateLimits.graphql]
             .filter(Boolean)
             .map(
                 (value) =>
@@ -820,6 +820,25 @@
                     )}`,
             )
             .join("；");
+    }
+
+    function formatRateLimitChange(before, after) {
+        const changes = [];
+        for (const [label, key] of [
+            ["REST", "rest"],
+            ["GraphQL", "graphql"],
+        ]) {
+            const previous = before?.[key];
+            const current = after?.[key];
+            if (!previous || !current) continue;
+            if (previous.resetAt !== current.resetAt) {
+                changes.push(`${label} 额度窗口已重置`);
+            } else {
+                const delta = current.used - previous.used;
+                changes.push(`${label} ${delta >= 0 ? "+" : ""}${delta}`);
+            }
+        }
+        return changes.length ? `分析期间额度变化：${changes.join("，")}` : "";
     }
 
     function formatApiError(message, response) {
@@ -1014,6 +1033,38 @@
                 },
             });
         });
+    }
+
+    async function fetchRateLimits(token) {
+        const result = await requestRest(
+            token,
+            "https://api.github.com/rate_limit",
+            { expectArray: false },
+        );
+        const normalize = (value, resource) => {
+            const limit = Number(value?.limit);
+            const remaining = Number(value?.remaining);
+            const used = Number(value?.used);
+            const reset = Number(value?.reset);
+            if (![limit, remaining, used, reset].every(Number.isFinite)) {
+                return null;
+            }
+            return {
+                limit,
+                remaining,
+                resource,
+                used,
+                resetAt: new Date(reset * 1000).toISOString(),
+            };
+        };
+        const rateLimits = {
+            rest: normalize(result.data?.resources?.core, "core"),
+            graphql: normalize(result.data?.resources?.graphql, "graphql"),
+        };
+        if (!rateLimits.rest && !rateLimits.graphql) {
+            throw new Error("GitHub /rate_limit 返回了意外的数据结构");
+        }
+        return rateLimits;
     }
 
     async function fetchRestPages(url, token, onPage) {
@@ -1595,6 +1646,13 @@
                 "低",
             ],
             [
+                "REST/GraphQL 当前额度",
+                "REST /rate_limit",
+                "按需及失败诊断",
+                "0 主额度；可能计入次级限流，不轮询",
+                "低",
+            ],
+            [
                 "逐条 Commit 的精确时间、匿名作者和 merge commit",
                 "未启用：需完整 Commit 分页",
                 "是",
@@ -1918,6 +1976,7 @@
     function setLoading(value) {
         loading = value;
         ui.analyze.disabled = value;
+        ui.refreshRateLimits.disabled = value;
         ui.scopeAll.disabled = value;
         ui.scopeOpen.disabled = value;
         ui.includeIssues.disabled = value;
@@ -1963,6 +2022,34 @@
         ui.export.disabled = true;
     }
 
+    async function refreshRateLimits() {
+        if (loading) return;
+        const token = String(GM_getValue(TOKEN_KEY, "")).trim();
+        if (!token) {
+            ui.settings.open = true;
+            setStatus("请先在 Token 设置中保存 GitHub Token", "error");
+            return;
+        }
+        ui.refreshRateLimits.disabled = true;
+        ui.analyze.disabled = true;
+        setStatus("正在通过 GitHub /rate_limit 查询额度…");
+        try {
+            lastRateLimits = await fetchRateLimits(token);
+            setStatus(
+                `额度查询完成（不消耗 REST 主额度）；${formatRateLimits()}`,
+                "success",
+            );
+        } catch (error) {
+            setStatus(
+                `额度查询失败；${error.message || String(error)}`,
+                "error",
+            );
+        } finally {
+            ui.refreshRateLimits.disabled = false;
+            ui.analyze.disabled = false;
+        }
+    }
+
     async function runAnalysis() {
         if (loading || !currentRepository) return;
         const token = String(GM_getValue(TOKEN_KEY, "")).trim();
@@ -2004,6 +2091,18 @@
                 requestedScope === "open" ? "仅 Open" : "全部历史"
             }；低额度策略：${strategy}；${modules}`,
         );
+        let baselineRateLimits = null;
+        try {
+            baselineRateLimits = await fetchRateLimits(token);
+            lastRateLimits = baselineRateLimits;
+            setStatus(
+                `分析前额度基线（通过 /rate_limit 查询，不消耗 REST 主额度）；${formatRateLimits(baselineRateLimits)}`,
+            );
+        } catch (error) {
+            setStatus(
+                `分析前额度查询失败，继续分析；${error.message || String(error)}`,
+            );
+        }
         try {
             const result = await fetchPullRequests(
                 currentRepository,
@@ -2025,11 +2124,42 @@
             analyzedScope = requestedScope;
             analyzedOptions = requestedOptions;
             overflowItems = result.overflow;
-            lastRateLimits = result.rateLimits;
+            lastRateLimits = {
+                rest:
+                    result.rateLimits.rest || baselineRateLimits?.rest || null,
+                graphql:
+                    result.rateLimits.graphql ||
+                    baselineRateLimits?.graphql ||
+                    null,
+            };
+            analysis.rateLimits = lastRateLimits;
             lastUsage = result.usage;
+            const rateLimitChange = formatRateLimitChange(
+                baselineRateLimits,
+                lastRateLimits,
+            );
+            if (rateLimitChange) {
+                setStatus(
+                    `分析后额度（来自 API 响应）；${formatRateLimits()}；${rateLimitChange}`,
+                );
+            }
             render();
         } catch (error) {
-            setStatus(error.message || String(error), "error");
+            let quotaDetails = "";
+            try {
+                lastRateLimits = await fetchRateLimits(token);
+                const rateLimitChange = formatRateLimitChange(
+                    baselineRateLimits,
+                    lastRateLimits,
+                );
+                quotaDetails = `；失败后通过 /rate_limit 查询：${formatRateLimits()}${rateLimitChange ? `；${rateLimitChange}` : ""}`;
+            } catch (quotaError) {
+                quotaDetails = `；失败后额度查询也失败：${quotaError.message || String(quotaError)}`;
+            }
+            setStatus(
+                `${error.message || String(error)}${quotaDetails}`,
+                "error",
+            );
         } finally {
             setLoading(false);
         }
@@ -2040,6 +2170,7 @@
         const payload = {
             ...analysis.raw,
             coverage: analysis.coverage,
+            rateLimits: analysis.rateLimits || lastRateLimits,
             usage: analysis.usage,
             derived: {
                 pullRequests: analysis.rows,
@@ -2215,6 +2346,7 @@
                   <button id="scope-open" class="active">仅 Open</button>
                 </div>
                 <button id="analyze" class="button primary">开始分析</button>
+                <button id="refresh-rate-limits" class="button">刷新额度</button>
                 <button id="export" class="button" disabled>导出 JSON</button>
               </div>
               <div class="options" aria-label="分析模块">
@@ -2282,6 +2414,7 @@
             title: get("#title"),
             close: get("#close"),
             analyze: get("#analyze"),
+            refreshRateLimits: get("#refresh-rate-limits"),
             export: get("#export"),
             scopeAll: get("#scope-all"),
             scopeOpen: get("#scope-open"),
@@ -2330,6 +2463,7 @@
             ui.launcher.setAttribute("aria-expanded", "false");
         });
         ui.analyze.addEventListener("click", runAnalysis);
+        ui.refreshRateLimits.addEventListener("click", refreshRateLimits);
         ui.export.addEventListener("click", exportAnalysis);
         ui.scopeAll.addEventListener("click", () => setScope("all"));
         ui.scopeOpen.addEventListener("click", () => setScope("open"));
@@ -2409,7 +2543,9 @@
             buildContributorStatistics,
             classifyLanguage,
             fetchPullRequests,
+            fetchRateLimits,
             formatRateLimit,
+            formatRateLimitChange,
             normalizeRestComment,
             normalizeRestReview,
             pullNumberFromUrl,
