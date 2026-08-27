@@ -107,7 +107,7 @@ class TestCanvasShapeSelection(unittest.TestCase):
 
         self.assertEqual(self.canvas.selected_shapes, [inner])
 
-    def test_auto_highlight_click_allows_move_until_mouse_leaves(self):
+    def test_clicking_auto_highlight_keeps_selection_when_mouse_leaves(self):
         shape = self.make_rectangle("shape", 40, 40, 80, 80)
         self.canvas.shapes = [shape]
         self.canvas.h_shape_is_hovered = True
@@ -130,6 +130,31 @@ class TestCanvasShapeSelection(unittest.TestCase):
 
         self._move_mouse(180, 180)
 
+        self.assertEqual(self.canvas.selected_shapes, [shape])
+
+    def test_explicit_selection_survives_auto_highlight_mouse_move(self):
+        selected = self.make_rectangle("selected", 40, 40, 80, 80)
+        hovered = self.make_rectangle("hovered", 100, 100, 140, 140)
+        self.canvas.shapes = [selected, hovered]
+        self.canvas.h_shape_is_hovered = True
+        self.canvas.select_shapes([selected])
+
+        self._move_mouse(120, 120)
+        self.assertEqual(self.canvas.selected_shapes, [selected])
+        self.assertIs(self.canvas.h_shape, hovered)
+
+        self._move_mouse(180, 180)
+        self.assertEqual(self.canvas.selected_shapes, [selected])
+
+    def test_auto_highlight_without_click_is_transient(self):
+        shape = self.make_rectangle("shape", 40, 40, 80, 80)
+        self.canvas.shapes = [shape]
+        self.canvas.h_shape_is_hovered = True
+
+        self._move_mouse(60, 60)
+        self.assertEqual(self.canvas.selected_shapes, [shape])
+
+        self._move_mouse(180, 180)
         self.assertEqual(self.canvas.selected_shapes, [])
 
     def test_finishing_shape_move_requests_repaint(self):

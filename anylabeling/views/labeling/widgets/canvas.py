@@ -175,6 +175,7 @@ class Canvas(
         self.snapping = True
         self.h_shape_is_selected = False
         self.h_shape_is_hovered = None
+        self._hover_selected_shape = None
         self._selected_group_id = None
         self._hovered_group_id = None
         self.allowed_oop_shape_types = ["rotation", "quadrilateral", "cuboid"]
@@ -2468,13 +2469,18 @@ class Canvas(
                     CURSOR_DEFAULT if shape.locked else CURSOR_GRAB
                 )
                 # [Feature] Automatically highlight shape when the mouse is moved inside it
-                if self.h_shape_is_hovered:
+                if self.h_shape_is_hovered and (
+                    not self.selected_shapes
+                    or self.selected_shapes == [self._hover_selected_shape]
+                ):
                     group_mode = (
                         ev.modifiers()
                         == QtCore.Qt.KeyboardModifier.ControlModifier
                     )
                     self.select_shape_point(
-                        pos, multiple_selection_mode=group_mode
+                        pos,
+                        multiple_selection_mode=group_mode,
+                        from_hover=True,
                     )
                 self.update()
 
@@ -2501,8 +2507,11 @@ class Canvas(
             self.override_cursor(CURSOR_DEFAULT)
             self.setToolTip("")
             self.setStatusTip("")
-            if self.h_shape_is_hovered and self.selected_shapes:
+            if self.h_shape_is_hovered and self.selected_shapes == [
+                self._hover_selected_shape
+            ]:
                 self.deselect_shape()
+                self._hover_selected_shape = None
         self.vertex_selected.emit(self.h_vertex is not None)
 
         if prev_hover_shape != self.h_shape:
@@ -2981,13 +2990,17 @@ class Canvas(
 
     def select_shapes(self, shapes):
         """Select some shapes"""
+        self._hover_selected_shape = None
         self._selected_group_id = None
         self.set_hiding()
         self.selection_changed.emit(shapes)
         self.update()
 
-    def select_shape_point(self, point, multiple_selection_mode):  # noqa: C901
+    def select_shape_point(
+        self, point, multiple_selection_mode, from_hover=False
+    ):  # noqa: C901
         """Select the first shape created which contains this point."""
+        self._hover_selected_shape = self.h_shape if from_hover else None
         self._selected_group_id = None
         if self.selected_vertex():  # A vertex is marked for selection.
             index, shape = self.h_vertex, self.h_shape
