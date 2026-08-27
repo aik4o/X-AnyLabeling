@@ -624,6 +624,109 @@ async function testSafeGraphqlPageFallback() {
     assert.match(logs.join("\n"), /原因：We couldn't respond to your request in time/);
 }
 
+async function testGraphqlNetworkErrorDetailsAndRetry() {
+    const logs = [];
+    const pageSizes = [];
+    const reset = 1773104400;
+    const resetAt = new Date(reset * 1000).toISOString();
+    global.GM_xmlhttpRequest = ({ url, data, onload, onerror }) => {
+        if (url === "https://api.github.com/rate_limit") {
+            onload({
+                status: 200,
+                responseHeaders: "",
+                responseText: JSON.stringify({
+                    resources: {
+                        core: {
+                            limit: 5000,
+                            used: 0,
+                            remaining: 5000,
+                            reset,
+                        },
+                        graphql: {
+                            limit: 5000,
+                            used: 10,
+                            remaining: 4990,
+                            reset,
+                        },
+                    },
+                }),
+            });
+            return;
+        }
+
+        const variables = JSON.parse(data).variables;
+        pageSizes.push(variables.pageSize);
+        if (pageSizes.length === 1) {
+            onerror({
+                status: 0,
+                statusText: "NetworkError",
+                readyState: 4,
+                finalUrl: "https://api.github.com/graphql",
+                responseHeaders: "",
+                responseText: "",
+            });
+            return;
+        }
+        onload({
+            status: 200,
+            responseHeaders: "",
+            responseText: JSON.stringify({
+                data: {
+                    repository: {
+                        pullRequests: {
+                            totalCount: 0,
+                            nodes: [],
+                            pageInfo: {
+                                hasNextPage: false,
+                                endCursor: null,
+                            },
+                        },
+                    },
+                    rateLimit: {
+                        cost: 1,
+                        limit: 5000,
+                        remaining: 4989,
+                        resetAt,
+                        used: 11,
+                    },
+                },
+            }),
+        });
+    };
+
+    await stats.fetchRepositoryData(
+        { owner: "o", name: "r" },
+        "token",
+        "all",
+        (message) => logs.push(message),
+        {
+            includeIssues: false,
+            includeCommits: false,
+            completeInteractions: false,
+        },
+        {
+            rest: null,
+            graphql: {
+                limit: 5000,
+                used: 10,
+                remaining: 4990,
+                resetAt,
+                resource: "graphql",
+            },
+        },
+    );
+
+    assert.deepEqual(pageSizes, [100, 90]);
+    assert.match(
+        logs.join("\n"),
+        /网络层错误（GM_xmlhttpRequest\.onerror）/,
+    );
+    assert.match(logs.join("\n"), /网络状态 0（未收到 HTTP 响应）/);
+    assert.match(logs.join("\n"), /statusText：NetworkError/);
+    assert.match(logs.join("\n"), /readyState：4/);
+    assert.match(logs.join("\n"), /对象上限 100 → 90\/页后自动重试/);
+}
+
 async function testPageSizeDropsAndRecoversByTen() {
     const logs = [];
     const pageSizes = [];
@@ -783,6 +886,7 @@ testSeparatedLocalAnalysis()
     .then(testGraphqlErrorDetails)
     .then(testGraphqlPauseAndResumeFromCheckpoint)
     .then(testSafeGraphqlPageFallback)
+    .then(testGraphqlNetworkErrorDetailsAndRetry)
     .then(testPageSizeDropsAndRecoversByTen)
     .then(testRateLimitLookup)
     .then(() => console.log("github_pr_statistics tests passed"))

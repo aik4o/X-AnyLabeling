@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.6
+// @version      0.6.7
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.6";
+    const SCRIPT_VERSION = "0.6.7";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -854,6 +854,59 @@
         return details.join("；");
     }
 
+    function createTransportError(apiName, eventName, response = {}) {
+        const status = Number(response?.status);
+        const hasStatus = Number.isFinite(status);
+        const details = [`${apiName} ${eventName}`];
+        if (hasStatus) {
+            details.push(
+                status === 0
+                    ? "网络状态 0（未收到 HTTP 响应）"
+                    : `HTTP ${status}`,
+            );
+        }
+        if (response?.statusText) {
+            details.push(`statusText：${response.statusText}`);
+        }
+        if (response?.readyState !== undefined) {
+            details.push(`readyState：${response.readyState}`);
+        }
+        if (response?.finalUrl) {
+            details.push(`最终 URL：${response.finalUrl}`);
+        }
+        const requestId = responseHeader(response, "x-github-request-id");
+        if (requestId) details.push(`GitHub Request ID ${requestId}`);
+        const responseText = String(response?.responseText || "")
+            .trim()
+            .replace(/\s+/g, " ")
+            .slice(0, 160);
+        if (responseText) details.push(`响应摘要：${responseText}`);
+        const transportMessage = response?.error || response?.message;
+        if (transportMessage) {
+            details.push(`底层信息：${String(transportMessage)}`);
+        }
+        if (
+            typeof navigator !== "undefined" &&
+            typeof navigator.onLine === "boolean"
+        ) {
+            details.push(`navigator.onLine：${navigator.onLine}`);
+        }
+        if (
+            status === 0 &&
+            !response?.statusText &&
+            !transportMessage &&
+            !responseText
+        ) {
+            details.push(
+                "浏览器/Tampermonkey 未暴露更具体原因（可能是临时断网、DNS、代理或 TLS 连接失败）",
+            );
+        }
+        const error = new Error(details.join("；"));
+        error.status = hasStatus ? status : null;
+        error.transport = true;
+        return error;
+    }
+
     function parseRepository() {
         const parts = location.pathname.split("/").filter(Boolean);
         const repositoryTabs = new Set([
@@ -870,6 +923,7 @@
 
     function isRetryableGraphqlFailure(error) {
         return (
+            error?.transport === true ||
             [500, 502, 503, 504].includes(Number(error?.status)) ||
             /请求超时|respond to your request in time|timed out|timeout/i.test(
                 String(error?.message || error || ""),
@@ -973,11 +1027,23 @@
                     }
                     resolve(payload.data);
                 },
-                onerror() {
-                    reject(new Error("无法连接 GitHub API"));
+                onerror(response) {
+                    reject(
+                        createTransportError(
+                            "GitHub GraphQL",
+                            "网络层错误（GM_xmlhttpRequest.onerror）",
+                            response,
+                        ),
+                    );
                 },
-                ontimeout() {
-                    reject(new Error("GitHub API 请求超时"));
+                ontimeout(response) {
+                    reject(
+                        createTransportError(
+                            "GitHub GraphQL",
+                            "请求超时（GM_xmlhttpRequest.ontimeout）",
+                            response,
+                        ),
+                    );
                 },
             });
         });
@@ -1042,11 +1108,23 @@
                         ),
                     });
                 },
-                onerror() {
-                    reject(new Error("无法连接 GitHub REST API"));
+                onerror(response) {
+                    reject(
+                        createTransportError(
+                            "GitHub REST API",
+                            "网络层错误（GM_xmlhttpRequest.onerror）",
+                            response,
+                        ),
+                    );
                 },
-                ontimeout() {
-                    reject(new Error("GitHub REST API 请求超时"));
+                ontimeout(response) {
+                    reject(
+                        createTransportError(
+                            "GitHub REST API",
+                            "请求超时（GM_xmlhttpRequest.ontimeout）",
+                            response,
+                        ),
+                    );
                 },
             });
         });
