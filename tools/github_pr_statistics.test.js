@@ -483,6 +483,141 @@ async function testSlowPageDownshiftsWithoutRetry() {
     assert.match(logs.join("\n"), /后续页对象上限 50 → 25\/页/);
 }
 
+async function testCheckpointResumesFromNextPage() {
+    const storage = new Map();
+    const logs = [];
+    const originalGetValue = global.GM_getValue;
+    const originalSetValue = global.GM_setValue;
+    const originalDeleteValue = global.GM_deleteValue;
+    const originalRequest = global.GM_xmlhttpRequest;
+    const clone = (value) => JSON.parse(JSON.stringify(value));
+    const pullRequest = (number) => ({
+        number,
+        title: `PR ${number}`,
+        body: "",
+        url: `https://github.com/o/r/pull/${number}`,
+        state: "OPEN",
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+        closedAt: null,
+        mergedAt: null,
+        isDraft: false,
+        authorAssociation: "NONE",
+        author: { login: `author-${number}` },
+        comments: {
+            totalCount: 0,
+            pageInfo: { hasNextPage: false },
+            nodes: [],
+        },
+        reviews: {
+            totalCount: 0,
+            pageInfo: { hasNextPage: false },
+            nodes: [],
+        },
+        commits: { totalCount: 0, nodes: [] },
+        additions: 0,
+        deletions: 0,
+        changedFiles: 0,
+    });
+    const graphQlResponse = (node, hasNextPage, endCursor, used) => ({
+        status: 200,
+        responseHeaders: "",
+        responseText: JSON.stringify({
+            data: {
+                repository: {
+                    pullRequests: {
+                        totalCount: 2,
+                        nodes: [node],
+                        pageInfo: { hasNextPage, endCursor },
+                    },
+                },
+                rateLimit: {
+                    cost: 1,
+                    limit: 5000,
+                    remaining: 5000 - used,
+                    resetAt: "2026-03-10T01:00:00Z",
+                    used,
+                },
+            },
+        }),
+    });
+
+    global.GM_getValue = (key, fallback) =>
+        storage.has(key) ? clone(storage.get(key)) : fallback;
+    global.GM_setValue = (key, value) => storage.set(key, clone(value));
+    global.GM_deleteValue = (key) => storage.delete(key);
+
+    const options = {
+        includeIssues: false,
+        includeCommits: false,
+        includeDraftHistory: false,
+        completeInteractions: false,
+        resumeIncomplete: true,
+    };
+    try {
+        let firstRunRequests = 0;
+        global.GM_xmlhttpRequest = ({ onload }) => {
+            firstRunRequests += 1;
+            if (firstRunRequests === 1) {
+                onload(graphQlResponse(pullRequest(1), true, "cursor-1", 1));
+                return;
+            }
+            onload({
+                status: 500,
+                statusText: "Internal Server Error",
+                responseHeaders: "content-type: text/plain\r\n",
+                responseText: "temporary failure",
+            });
+        };
+        await assert.rejects(
+            stats.fetchPullRequests(
+                { owner: "o", name: "r" },
+                "token",
+                "all",
+                () => {},
+                options,
+            ),
+            /PR 第 2 页/,
+        );
+        assert.equal(firstRunRequests, 2);
+        assert.equal(
+            [...storage.entries()].some(
+                ([key, value]) =>
+                    key.startsWith("github-pr-statistics-checkpoint-v1:") &&
+                    value?.version === 1,
+            ),
+            true,
+        );
+
+        const resumedVariables = [];
+        global.GM_xmlhttpRequest = ({ data, onload }) => {
+            resumedVariables.push(JSON.parse(data).variables);
+            onload(graphQlResponse(pullRequest(2), false, null, 2));
+        };
+        const result = await stats.fetchPullRequests(
+            { owner: "o", name: "r" },
+            "token",
+            "all",
+            (message) => logs.push(message),
+            options,
+        );
+
+        assert.equal(resumedVariables.length, 1);
+        assert.equal(resumedVariables[0].prCursor, "cursor-1");
+        assert.equal(resumedVariables[0].pageSize, 50);
+        assert.equal(result.rows.length, 2);
+        assert.equal(result.usage.graphqlRequests, 2);
+        assert.equal(result.usage.graphqlPoints, 2);
+        assert.match(logs.join("\n"), /已恢复.*断点.*PR 1\/2/);
+        assert.equal(storage.size, 0);
+    } finally {
+        global.GM_getValue = originalGetValue;
+        global.GM_setValue = originalSetValue;
+        global.GM_deleteValue = originalDeleteValue;
+        global.GM_xmlhttpRequest = originalRequest;
+    }
+}
+
 async function testRateLimitLookup() {
     global.GM_xmlhttpRequest = ({ method, url, onload }) => {
         assert.equal(method, "GET");
@@ -532,6 +667,7 @@ testAllHistorySplitsPullsAndIssues()
     .then(testGraphqlErrorDetails)
     .then(testSafeGraphqlPageFallback)
     .then(testSlowPageDownshiftsWithoutRetry)
+    .then(testCheckpointResumesFromNextPage)
     .then(testRateLimitLookup)
     .then(() => console.log("github_pr_statistics tests passed"))
     .catch((error) => {
