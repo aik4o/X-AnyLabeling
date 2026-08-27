@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.3.4
+// @version      0.4.0
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -757,8 +757,13 @@
 
     function rate(numerator, denominator) {
         return denominator
-            ? `${((100 * numerator) / denominator).toFixed(2)}%`
+            ? `${percentage(numerator, denominator).toFixed(2)}%`
             : "—";
+    }
+
+    function percentage(numerator, denominator) {
+        const value = (100 * Number(numerator)) / Number(denominator);
+        return Number.isFinite(value) ? value : 0;
     }
 
     function formatRateLimit(value) {
@@ -1560,6 +1565,46 @@
             .join("");
     }
 
+    function barChartMarkup(title, rows, maximum = 100) {
+        const scale = Number.isFinite(maximum) && maximum > 0 ? maximum : 1;
+        const tones = new Set([
+            "blue",
+            "green",
+            "orange",
+            "purple",
+            "red",
+            "gray",
+        ]);
+        return `
+            <article class="chart-card">
+              <h4>${escapeHtml(title)}</h4>
+              <div class="chart-bars">
+                ${rows
+                    .map(([label, value, display = value, tone = "blue"]) => {
+                        const numeric = Number(value);
+                        const width = Math.max(
+                            0,
+                            Math.min(
+                                100,
+                                (100 * (Number.isFinite(numeric) ? numeric : 0)) /
+                                    scale,
+                            ),
+                        );
+                        const safeTone = tones.has(tone) ? tone : "blue";
+                        const ariaLabel = `${label} ${display}`;
+                        return `
+                          <div class="chart-row" role="img" aria-label="${escapeHtml(ariaLabel)}">
+                            <div class="chart-label"><span>${escapeHtml(label)}</span><strong>${escapeHtml(display)}</strong></div>
+                            <div class="chart-track"><span class="chart-fill tone-${safeTone}" style="width:${width.toFixed(2)}%"></span></div>
+                          </div>
+                        `;
+                    })
+                    .join("")}
+              </div>
+            </article>
+        `;
+    }
+
     function contributorRole(row) {
         if (row.bot) return "机器人";
         const roles = [];
@@ -1676,9 +1721,15 @@
         const summary = summarizePullRequests(analysis.rows, scope);
         const isOpen = scope === "open";
         const total = summary.total.count;
+        const rateRow = (label, value, denominator, tone = "blue") => [
+            label,
+            percentage(value, denominator),
+            countAndRate(value, denominator),
+            tone,
+        ];
         const cards = isOpen
             ? [
-                  ["Open PR", total],
+                  ["Open PR", total, "key"],
                   [
                       "中文 Open PR",
                       countAndRate(summary.chinese.count, total),
@@ -1686,6 +1737,11 @@
                   [
                       "英文 Open PR",
                       countAndRate(summary.english.count, total),
+                  ],
+                  [
+                      "维护者回复率",
+                      rate(summary.total.maintainerReplied, total),
+                      "key",
                   ],
                   [
                       "中文维护者回复率",
@@ -1711,6 +1767,7 @@
                   ],
               ]
             : [
+                  ["PR", total, "key"],
                   [
                       "中文 PR",
                       countAndRate(summary.chinese.count, total),
@@ -1719,7 +1776,7 @@
                       "英文 PR",
                       countAndRate(summary.english.count, total),
                   ],
-                  ["总体合并率", rate(summary.total.merged, total)],
+                  ["总体合并率", rate(summary.total.merged, total), "key"],
                   [
                       "中文合并率",
                       rate(summary.chinese.merged, summary.chinese.count),
@@ -1735,6 +1792,7 @@
                   [
                       "维护者回复率",
                       rate(summary.total.maintainerReplied, total),
+                      "key",
                   ],
                   [
                       "首次维护者回复中位数",
@@ -1759,6 +1817,70 @@
               ];
 
         ui.cards.innerHTML = cardsMarkup(cards);
+        const languageRows = [
+            rateRow("中文", summary.chinese.count, total, "purple"),
+            rateRow("英文", summary.english.count, total, "blue"),
+        ];
+        const comparisonRows = isOpen
+            ? [
+                  rateRow(
+                      "全部",
+                      summary.total.maintainerReplied,
+                      total,
+                      "green",
+                  ),
+                  rateRow(
+                      "中文",
+                      summary.chinese.maintainerReplied,
+                      summary.chinese.count,
+                      "purple",
+                  ),
+                  rateRow(
+                      "英文",
+                      summary.english.maintainerReplied,
+                      summary.english.count,
+                      "blue",
+                  ),
+              ]
+            : [
+                  rateRow("全部", summary.total.merged, total, "green"),
+                  rateRow(
+                      "中文",
+                      summary.chinese.merged,
+                      summary.chinese.count,
+                      "purple",
+                  ),
+                  rateRow(
+                      "英文",
+                      summary.english.merged,
+                      summary.english.count,
+                      "blue",
+                  ),
+              ];
+        const healthRows = [
+            rateRow(
+                "提交者回复",
+                summary.total.submitterReplied,
+                total,
+                "blue",
+            ),
+            rateRow(
+                "维护者回复",
+                summary.total.maintainerReplied,
+                total,
+                "green",
+            ),
+            rateRow("30 天 stale", summary.total.stale30, total, "orange"),
+            rateRow("90 天 stale", summary.total.stale90, total, "red"),
+        ];
+        ui.prCharts.innerHTML = [
+            barChartMarkup("语言分布", languageRows),
+            barChartMarkup(
+                isOpen ? "维护者回复率（按语言）" : "合并率（按语言）",
+                comparisonRows,
+            ),
+            barChartMarkup("协作与健康", healthRows),
+        ].join("");
 
         const mergeHeader = isOpen
             ? ""
@@ -1821,8 +1943,12 @@
         if (analysis.coverage.issues) {
             const issues = summarizeIssues(analysis.issueRows, scope);
             ui.issueCards.innerHTML = cardsMarkup([
-                [isOpen ? "Open Issue" : "Issue", issues.count],
-                ["维护者回复率", rate(issues.maintainerReplied, issues.count)],
+                [isOpen ? "Open Issue" : "Issue", issues.count, "key"],
+                [
+                    "维护者回复率",
+                    rate(issues.maintainerReplied, issues.count),
+                    "key",
+                ],
                 ["无人回复率", rate(issues.noResponse, issues.count)],
                 ["30 天 stale", countAndRate(issues.stale30, issues.count)],
                 ["首次回复中位数", formatDuration(issues.medianFirstResponseHours)],
@@ -1838,6 +1964,57 @@
                     "latest",
                 ],
             ]);
+            const issueResponseRows = [
+                rateRow(
+                    "维护者已回复",
+                    issues.maintainerReplied,
+                    issues.count,
+                    "green",
+                ),
+                rateRow("无人回复", issues.noResponse, issues.count, "red"),
+                rateRow("30 天 stale", issues.stale30, issues.count, "orange"),
+                rateRow("90 天 stale", issues.stale90, issues.count, "purple"),
+            ];
+            if (!isOpen) {
+                issueResponseRows.push(
+                    rateRow(
+                        "由 PR 关闭",
+                        issues.closedByPr,
+                        issues.closed,
+                        "blue",
+                    ),
+                );
+            }
+            const categoryRows = [
+                ["Bug", issues.categories.bug, issues.categories.bug, "red"],
+                [
+                    "Feature",
+                    issues.categories.feature,
+                    issues.categories.feature,
+                    "blue",
+                ],
+                ["Docs", issues.categories.docs, issues.categories.docs, "purple"],
+                [
+                    "Good first",
+                    issues.categories.goodFirst,
+                    issues.categories.goodFirst,
+                    "green",
+                ],
+                [
+                    "Help wanted",
+                    issues.categories.helpWanted,
+                    issues.categories.helpWanted,
+                    "orange",
+                ],
+            ];
+            ui.issueCharts.innerHTML = [
+                barChartMarkup("响应与健康", issueResponseRows),
+                barChartMarkup(
+                    "Issue 分类",
+                    categoryRows,
+                    Math.max(1, ...categoryRows.map((row) => row[1])),
+                ),
+            ].join("");
             ui.issueTable.innerHTML = `
                 <thead><tr><th>Bug</th><th>Feature</th><th>Docs</th><th>Good first issue</th><th>Help wanted</th></tr></thead>
                 <tbody><tr>
@@ -1852,8 +2029,8 @@
 
         const contributorSummary = analysis.contributors;
         ui.contributorCards.innerHTML = cardsMarkup([
-            ["贡献者", contributorSummary.count],
-            ["近 30 天活跃", contributorSummary.active30],
+            ["贡献者", contributorSummary.count, "key"],
+            ["近 30 天活跃", contributorSummary.active30, "key"],
             ["近 90 天活跃", contributorSummary.active90],
             ["外部贡献者", contributorSummary.external],
             ["持续外部贡献者", contributorSummary.recurringExternal],
@@ -1866,6 +2043,62 @@
                 contributorSummary.firstTime,
             ],
         ]);
+        const contributorStructureRows = [
+            rateRow(
+                "外部贡献者",
+                contributorSummary.external,
+                contributorSummary.count,
+                "blue",
+            ),
+            rateRow(
+                "持续外部",
+                contributorSummary.recurringExternal,
+                contributorSummary.count,
+                "purple",
+            ),
+            rateRow(
+                "内部成员",
+                contributorSummary.internal,
+                contributorSummary.count,
+                "green",
+            ),
+            rateRow(
+                "核心贡献者",
+                contributorSummary.core,
+                contributorSummary.count,
+                "orange",
+            ),
+            rateRow(
+                analysis.coverage.fullHistory ? "首次贡献者" : "Open 中首次",
+                contributorSummary.firstTime,
+                contributorSummary.count,
+                "gray",
+            ),
+        ];
+        const contributorActivityRows = [
+            rateRow(
+                "近 30 天",
+                contributorSummary.active30,
+                contributorSummary.count,
+                "green",
+            ),
+            rateRow(
+                "近 90 天",
+                contributorSummary.active90,
+                contributorSummary.count,
+                "blue",
+            ),
+            rateRow(
+                "近 365 天",
+                contributorSummary.active365,
+                contributorSummary.count,
+                "purple",
+            ),
+        ];
+        ui.contributorCharts.innerHTML = [
+            barChartMarkup("贡献者结构", contributorStructureRows),
+            barChartMarkup("最近活跃", contributorActivityRows),
+        ].join("");
         ui.contributorTable.innerHTML = `
             <thead><tr><th>贡献者</th><th>最近活跃</th><th>角色</th><th>PR / 合并</th><th>Issue</th><th>评论</th><th>Review</th><th>Commit</th></tr></thead>
             <tbody>${contributorSummary.rows
@@ -1890,20 +2123,45 @@
             const commits = analysis.commitStats;
             if (commits) {
                 ui.commitCards.innerHTML = cardsMarkup([
-                    ["统计作者 Commit", commits.totalCommits],
-                    ["作者数", commits.contributorCount],
+                    ["统计作者 Commit", commits.totalCommits, "key"],
+                    ["作者数", commits.contributorCount, "key"],
                     ["Top 1 占比", rate(commits.authors[0]?.total || 0, commits.totalCommits)],
                     ["Top 3 占比", `${(commits.top3Share * 100).toFixed(2)}%`],
                     ["Top 5 占比", `${(commits.top5Share * 100).toFixed(2)}%`],
                     ["最近活跃周", formatDate(commits.lastActiveWeek)],
-                    [
-                        "最近月份分布",
-                        commits.monthly
-                            .map(([month, count]) => `${month}: ${count}`)
-                            .join(" · ") || "—",
-                        "wide",
-                    ],
                 ]);
+                const monthlyRows = commits.monthly.map(
+                    ([month, count], index) => [
+                        month,
+                        count,
+                        count,
+                        ["blue", "green", "purple"][index % 3],
+                    ],
+                );
+                const authorRows = commits.authors
+                    .slice(0, 8)
+                    .map((row, index) => [
+                        row.login,
+                        row.total,
+                        `${row.total}（${rate(row.total, commits.totalCommits)}）`,
+                        ["green", "blue", "purple", "orange"][index % 4],
+                    ]);
+                ui.commitCharts.innerHTML = [
+                    monthlyRows.length
+                        ? barChartMarkup(
+                              "最近 12 个月 Commit",
+                              monthlyRows,
+                              Math.max(1, ...monthlyRows.map((row) => row[1])),
+                          )
+                        : "",
+                    authorRows.length
+                        ? barChartMarkup(
+                              "Top Commit 作者",
+                              authorRows,
+                              Math.max(1, ...authorRows.map((row) => row[1])),
+                          )
+                        : "",
+                ].join("");
                 ui.commitTable.innerHTML = `
                     <thead><tr><th>作者</th><th>Commit</th><th>占比</th></tr></thead>
                     <tbody>${commits.authors
@@ -1923,6 +2181,7 @@
                         "wide",
                     ],
                 ]);
+                ui.commitCharts.innerHTML = "";
                 ui.commitTable.innerHTML = "";
             }
         }
@@ -1999,12 +2258,16 @@
     function resetOutput() {
         for (const element of [
             ui.cards,
+            ui.prCharts,
             ui.table,
             ui.issueCards,
+            ui.issueCharts,
             ui.issueTable,
             ui.contributorCards,
+            ui.contributorCharts,
             ui.contributorTable,
             ui.commitCards,
+            ui.commitCharts,
             ui.commitTable,
         ]) {
             element.innerHTML = "";
@@ -2226,6 +2489,12 @@
               --muted: var(--fgColor-muted, var(--color-fg-muted, #59636e));
               --border: var(--borderColor-default, var(--color-border-default, #d0d7de));
               --accent: var(--fgColor-accent, var(--color-accent-fg, #0969da));
+              --chart-blue: #2f81f7;
+              --chart-green: #3fb950;
+              --chart-orange: #d29922;
+              --chart-purple: #a371f7;
+              --chart-red: #f85149;
+              --chart-gray: #8c959f;
               font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             }
             [hidden] { display: none !important; }
@@ -2297,6 +2566,7 @@
             .section h3 { margin: 0 0 8px; font-size: 15px; }
             .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 8px; margin: 10px 0; }
             .card { min-width: 0; padding: 10px; background: var(--muted-bg); border: 1px solid var(--border); border-radius: 8px; }
+            .card.key { box-shadow: inset 3px 0 var(--accent); }
             .card span { display: block; color: var(--muted); margin-bottom: 4px; }
             .card strong { display: block; font-size: 17px; overflow-wrap: anywhere; }
             .card.latest { grid-column: span 2; }
@@ -2304,6 +2574,21 @@
             .card.latest strong span { margin-top: 3px; }
             .card.wide { grid-column: 1 / -1; }
             .card.wide strong { font-size: 13px; line-height: 1.55; }
+            .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; margin: 10px 0; }
+            .chart-card { min-width: 0; padding: 12px; background: var(--panel-bg); border: 1px solid var(--border); border-radius: 8px; }
+            .chart-card h4 { margin: 0 0 10px; font-size: 13px; }
+            .chart-row + .chart-row { margin-top: 9px; }
+            .chart-label { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+            .chart-label span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+            .chart-label strong { flex: none; font-size: 12px; }
+            .chart-track { height: 9px; overflow: hidden; background: var(--muted-bg); border-radius: 999px; }
+            .chart-fill { display: block; height: 100%; border-radius: inherit; }
+            .tone-blue { background: var(--chart-blue); }
+            .tone-green { background: var(--chart-green); }
+            .tone-orange { background: var(--chart-orange); }
+            .tone-purple { background: var(--chart-purple); }
+            .tone-red { background: var(--chart-red); }
+            .tone-gray { background: var(--chart-gray); }
             .table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
             table { width: 100%; border-collapse: collapse; white-space: nowrap; }
             th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
@@ -2314,6 +2599,7 @@
             a:hover { text-decoration: underline; }
             .reply span, .latest span { display: block; color: var(--muted); margin-top: 2px; }
             details { margin-top: 12px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; }
+            details.table-details { margin-top: 10px; }
             summary { cursor: pointer; font-weight: 600; }
             #token-state[data-configured="true"] { color: #1a7f37; }
             .token-row { display: flex; gap: 7px; margin-top: 10px; }
@@ -2351,22 +2637,26 @@
               <section class="section">
                 <h3>Pull Request</h3>
                 <div id="cards" class="cards"></div>
-                <div class="table-wrap"><table id="table"></table></div>
+                <div id="pr-charts" class="charts"></div>
+                <details class="table-details"><summary>查看 PR 详细对比表</summary><div class="table-wrap"><table id="table"></table></div></details>
               </section>
               <section id="issue-section" class="section" hidden>
                 <h3>Issue</h3>
                 <div id="issue-cards" class="cards"></div>
-                <div class="table-wrap"><table id="issue-table"></table></div>
+                <div id="issue-charts" class="charts"></div>
+                <details class="table-details"><summary>查看 Issue 分类表</summary><div class="table-wrap"><table id="issue-table"></table></div></details>
               </section>
               <section class="section">
                 <h3>贡献者（最近活跃优先，最多显示 25 人）</h3>
                 <div id="contributor-cards" class="cards"></div>
-                <div class="table-wrap"><table id="contributor-table"></table></div>
+                <div id="contributor-charts" class="charts"></div>
+                <details class="table-details"><summary>查看贡献者明细</summary><div class="table-wrap"><table id="contributor-table"></table></div></details>
               </section>
               <section id="commit-section" class="section" hidden>
                 <h3>Commit</h3>
                 <div id="commit-cards" class="cards"></div>
-                <div class="table-wrap"><table id="commit-table"></table></div>
+                <div id="commit-charts" class="charts"></div>
+                <details class="table-details"><summary>查看 Commit 作者明细</summary><div class="table-wrap"><table id="commit-table"></table></div></details>
               </section>
               <details open>
                 <summary>信息来源与 API 成本</summary>
@@ -2417,14 +2707,18 @@
             status: get("#status"),
             log: get("#log"),
             cards: get("#cards"),
+            prCharts: get("#pr-charts"),
             table: get("#table"),
             issueSection: get("#issue-section"),
             issueCards: get("#issue-cards"),
+            issueCharts: get("#issue-charts"),
             issueTable: get("#issue-table"),
             contributorCards: get("#contributor-cards"),
+            contributorCharts: get("#contributor-charts"),
             contributorTable: get("#contributor-table"),
             commitSection: get("#commit-section"),
             commitCards: get("#commit-cards"),
+            commitCharts: get("#commit-charts"),
             commitTable: get("#commit-table"),
             costTable: get("#cost-table"),
             settings: get("#settings"),
@@ -2532,6 +2826,7 @@
             analyzePullRequest,
             analyzeIssue,
             analyzeCommitContributors,
+            barChartMarkup,
             buildContributorStatistics,
             classifyLanguage,
             fetchPullRequests,
@@ -2540,6 +2835,7 @@
             formatRateLimitChange,
             normalizeRestComment,
             normalizeRestReview,
+            percentage,
             pullNumberFromUrl,
             rate,
             rateLimitFromHeaders,

@@ -135,6 +135,17 @@ assert.equal(
     true,
 );
 
+assert.equal(stats.percentage(1, 4), 25);
+assert.equal(stats.percentage(1, 0), 0);
+const chartMarkup = stats.barChartMarkup(
+    "回复率",
+    [["维护者 <回复>", 75, "3 / 4（75.00%）", "green"]],
+);
+assert.match(chartMarkup, /role="img"/);
+assert.match(chartMarkup, /width:75\.00%/);
+assert.match(chartMarkup, /维护者 &lt;回复&gt;/);
+assert.match(chartMarkup, /tone-green/);
+
 async function testAllHistorySplitsPullsAndIssues() {
     const requests = [];
     global.GM_xmlhttpRequest = ({ data, onload }) => {
