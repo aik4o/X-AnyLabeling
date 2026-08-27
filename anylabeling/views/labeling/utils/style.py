@@ -531,11 +531,6 @@ def get_dock_style() -> str:
             color: {t["text"]};
             border: none;
             outline: none;
-            selection-background-color: qlineargradient(
-                x1: 0, y1: 0, x2: 1, y2: 0,
-                stop: 0 {t["surface_hover"]}, stop: 1 {t["background"]}
-            );
-            selection-color: {t["text"]};
         }}
         QListWidget#FileList::item {{
             padding: 1px 0;

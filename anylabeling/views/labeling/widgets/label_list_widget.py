@@ -11,6 +11,7 @@ class HTMLDelegate(QtWidgets.QStyledItemDelegate):
     def __init__(self, parent=None):
         self.parent = parent
         self._lock_icon = QtGui.QIcon(":/images/images/lock.svg")
+        self._selection_icon = QtGui.QIcon(":/images/images/starred.svg")
         self._lock_pixmaps = {}
         super(HTMLDelegate, self).__init__()
 
@@ -30,6 +31,17 @@ class HTMLDelegate(QtWidgets.QStyledItemDelegate):
         doc = self._document_for_index(index, options.font)
         options.text = ""
 
+        selected = bool(options.state & QStyle.StateFlag.State_Selected)
+        uses_item_background = False
+        if selected:
+            background = index.data(Qt.ItemDataRole.BackgroundRole)
+            if (
+                isinstance(background, QtGui.QBrush)
+                and background.style() != Qt.BrushStyle.NoBrush
+            ):
+                options.palette.setBrush(QPalette.ColorRole.Highlight, background)
+                uses_item_background = True
+
         style = (
             QtWidgets.QApplication.style()
             if options.widget is None
@@ -41,12 +53,17 @@ class HTMLDelegate(QtWidgets.QStyledItemDelegate):
 
         ctx = QtGui.QAbstractTextDocumentLayout.PaintContext()
 
-        if option.state & QStyle.StateFlag.State_Selected:
+        if selected:
+            text_role = (
+                QPalette.ColorRole.Text
+                if uses_item_background
+                else QPalette.ColorRole.HighlightedText
+            )
             ctx.palette.setColor(
                 QPalette.ColorRole.Text,
                 option.palette.color(
                     QPalette.ColorGroup.Active,
-                    QPalette.ColorRole.HighlightedText,
+                    text_role,
                 ),
             )
         else:
@@ -64,6 +81,19 @@ class HTMLDelegate(QtWidgets.QStyledItemDelegate):
 
         if index.column() != 0:
             text_rect.adjust(5, 0, 0, 0)
+
+        if selected:
+            star_size = min(14, max(8, text_rect.height() - 4))
+            star_rect = QtCore.QRect(
+                text_rect.left(),
+                option.rect.center().y() - star_size // 2,
+                star_size,
+                star_size,
+            )
+            painter.drawPixmap(
+                star_rect, self._selection_icon.pixmap(star_size, star_size)
+            )
+            text_rect.setLeft(text_rect.left() + star_size + 4)
 
         if index.data(LOCKED_ROLE):
             icon_size = max(
