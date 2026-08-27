@@ -13,6 +13,10 @@ assert.match(
     userscriptSource,
     /ui\.analyze\.addEventListener\("click", runAnalysis\)/,
 );
+assert.doesNotMatch(
+    userscriptSource,
+    /isDraft|includeDraftHistory|CONVERT_TO_DRAFT_EVENT|READY_FOR_REVIEW_EVENT/,
+);
 
 const pr = {
     number: 7,
@@ -24,7 +28,6 @@ const pr = {
     updatedAt: "2026-01-03T00:00:00Z",
     closedAt: null,
     mergedAt: null,
-    isDraft: false,
     author: { login: "alice" },
     authorAssociation: "NONE",
     comments: {
@@ -52,15 +55,6 @@ const pr = {
     },
     reviewComments: [],
     inlineCommentsComplete: true,
-    timelineItems: {
-        pageInfo: { hasNextPage: false },
-        nodes: [
-            {
-                __typename: "ReadyForReviewEvent",
-                createdAt: "2026-01-01T12:00:00Z",
-            },
-        ],
-    },
     commits: { totalCount: 3 },
     additions: 20,
     deletions: 4,
@@ -74,7 +68,6 @@ const analyzedPr = stats.analyzePullRequest(
 assert.equal(analyzedPr.language, "chinese");
 assert.equal(analyzedPr.maintainerReplied, true);
 assert.equal(analyzedPr.submitterReplied, true);
-assert.equal(analyzedPr.everDraft, true);
 assert.equal(analyzedPr.firstMaintainerResponseHours, 24);
 assert.equal(analyzedPr.stale30, true);
 
@@ -250,7 +243,6 @@ async function testAllHistorySplitsPullsAndIssues() {
         {
             includeIssues: true,
             includeCommits: false,
-            includeDraftHistory: false,
             completeInteractions: false,
         },
     );
@@ -282,7 +274,6 @@ async function testAllHistorySplitsPullsAndIssues() {
         {
             includeIssues: true,
             includeCommits: false,
-            includeDraftHistory: false,
             completeInteractions: false,
         },
     );
@@ -343,7 +334,6 @@ async function testGraphqlErrorDetails() {
             {
                 includeIssues: false,
                 includeCommits: false,
-                includeDraftHistory: false,
                 completeInteractions: false,
             },
             {
@@ -452,7 +442,6 @@ async function testSafeGraphqlPageFallback() {
         {
             includeIssues: false,
             includeCommits: false,
-            includeDraftHistory: false,
             completeInteractions: false,
         },
         {
@@ -561,7 +550,6 @@ async function testPageSizeDropsAndRecoversByTen() {
         {
             includeIssues: false,
             includeCommits: false,
-            includeDraftHistory: false,
             completeInteractions: false,
         },
         {

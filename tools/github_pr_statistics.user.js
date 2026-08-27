@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.1
+// @version      0.6.2
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -23,7 +23,6 @@
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
-        includeDraftHistory: false,
         completeInteractions: false,
     });
     const MAX_PAGE_SIZE = 100;
@@ -49,7 +48,6 @@
           $pageSize: Int!
           $fetchPulls: Boolean!
           $fetchIssues: Boolean!
-          $includeDraftHistory: Boolean!
         ) {
           repository(owner: $owner, name: $name) {
             pullRequests(
@@ -64,7 +62,7 @@
                 number title body url state
                 createdAt updatedAt closedAt mergedAt
                 lastEditedAt editor { login }
-                isDraft authorAssociation
+                authorAssociation
                 author { login }
                 mergedBy { login }
                 baseRefName headRefName
@@ -94,20 +92,6 @@
                     author { login }
                     authorAssociation
                     createdAt submittedAt updatedAt
-                  }
-                }
-                timelineItems(
-                  first: ${INTERACTION_PREVIEW_SIZE}
-                  itemTypes: [
-                    CONVERT_TO_DRAFT_EVENT
-                    READY_FOR_REVIEW_EVENT
-                  ]
-                ) @include(if: $includeDraftHistory) {
-                  pageInfo { hasNextPage }
-                  nodes {
-                    __typename
-                    ... on ConvertToDraftEvent { createdAt }
-                    ... on ReadyForReviewEvent { createdAt }
                   }
                 }
               }
@@ -283,16 +267,6 @@
         );
         const firstMaintainerReply = earliestEvent(maintainerEvents);
         const lastHumanActivity = latestEvent(humanEvents);
-        const draftEvents = pr.timelineItems?.nodes || [];
-        const draftHistoryKnown = Boolean(pr.isDraft || pr.timelineItems);
-        const everDraft =
-            Boolean(pr.isDraft) ||
-            draftEvents.some((event) =>
-                [
-                    "ConvertToDraftEvent",
-                    "ReadyForReviewEvent",
-                ].includes(event.__typename),
-            );
         const staleDays = ageInDays(
             lastHumanActivity?.at || pr.createdAt,
             now,
@@ -314,12 +288,6 @@
             merged: Boolean(pr.mergedAt),
             open: pr.state === "OPEN",
             closedWithoutMerge: pr.state === "CLOSED" && !pr.mergedAt,
-            currentDraft: Boolean(pr.isDraft),
-            everDraft,
-            draftHistoryKnown,
-            draftHistoryComplete:
-                Boolean(pr.timelineItems) &&
-                !pr.timelineItems.pageInfo?.hasNextPage,
             submitterReplied: events.some((event) => event.login === author),
             maintainerReplied: maintainerEvents.length > 0,
             latestMaintainerReply: latestEvent(maintainerEvents),
@@ -475,9 +443,6 @@
                 .length,
             submitterReplied: rows.filter((row) => row.submitterReplied).length,
             maintainerReplied: rows.filter((row) => row.maintainerReplied).length,
-            currentDraft: rows.filter((row) => row.currentDraft).length,
-            everDraft: rows.filter((row) => row.everDraft).length,
-            draftKnown: rows.filter((row) => row.draftHistoryKnown).length,
             stale30: rows.filter((row) => row.stale30).length,
             stale90: rows.filter((row) => row.stale90).length,
             medianFirstMaintainerResponseHours: median(
@@ -1293,7 +1258,6 @@
             const fields = [];
             if (pr.comments?.pageInfo?.hasNextPage) fields.push("普通评论");
             if (pr.reviews?.pageInfo?.hasNextPage) fields.push("Reviews");
-            if (pr.timelineItems?.pageInfo?.hasNextPage) fields.push("Draft 时间线");
             if (fields.length) rows.push(`PR #${pr.number} ${fields.join("/")}`);
         }
         for (const issue of issues) {
@@ -1366,7 +1330,7 @@
             let requestSeconds;
             while (true) {
                 onProgress(
-                    `准备请求 GraphQL ${requestLabel}；对象上限 ${pageSize}/页；每个互动连接上限 ${INTERACTION_PREVIEW_SIZE} 条元数据（不含正文）；Draft 时间线${selectedOptions.includeDraftHistory ? "开启" : "关闭"}`,
+                    `准备请求 GraphQL ${requestLabel}；对象上限 ${pageSize}/页；每个互动连接上限 ${INTERACTION_PREVIEW_SIZE} 条元数据（不含正文）`,
                     null,
                 );
                 const requestStartedAt = Date.now();
@@ -1387,8 +1351,6 @@
                         pageSize,
                         fetchPulls: requestPulls,
                         fetchIssues: requestIssues,
-                        includeDraftHistory:
-                            selectedOptions.includeDraftHistory,
                     });
                     requestSeconds = (
                         (Date.now() - requestStartedAt) /
@@ -1580,7 +1542,6 @@
             coverage: {
                 fullHistory: selectedScope === "all",
                 issues: selectedOptions.includeIssues,
-                draftHistory: selectedOptions.includeDraftHistory,
                 completeInteractions: selectedOptions.completeInteractions,
                 inlineComments: selectedOptions.completeInteractions,
                 commitStatus: commitResult.status,
@@ -1802,17 +1763,11 @@
     }
 
     function renderCostGuide() {
-        const prCount = analysis?.rows.length || 0;
         const issueCount = analysis?.issueRows.length || 0;
         const usage = analysis?.usage || lastUsage;
-        const costOptions = selectedOptions();
-        const draftEstimate = Math.max(
-            1,
-            Math.ceil(prCount / MAX_PAGE_SIZE),
-        );
         const rows = [
             [
-                "PR 标题/正文/作者/状态/时间/改动量/当前 Draft/stale",
+                "PR 标题/正文/作者/状态/时间/改动量/stale",
                 "主 GraphQL 标量字段",
                 "否",
                 "0 额外 point",
@@ -1823,13 +1778,6 @@
                 "主 GraphQL 嵌套连接",
                 "否",
                 "实际 cost 见日志；与主查询合并",
-                "低-中",
-            ],
-            [
-                "曾经 Draft",
-                "PR Draft 时间线",
-                "可选",
-                `约 +${draftEstimate} GraphQL points；当前${costOptions.includeDraftHistory ? "已启用" : "未启用"}`,
                 "低-中",
             ],
             [
@@ -1951,7 +1899,6 @@
                   ],
                   ["30 天 stale", countAndRate(summary.total.stale30, total)],
                   ["90 天 stale", countAndRate(summary.total.stale90, total)],
-                  ["当前 Draft", countAndRate(summary.total.currentDraft, total)],
                   [
                       "维护者最近回复",
                       latestReplyHtml(summary.total.latestMaintainerReply, true),
@@ -1991,15 +1938,6 @@
                       formatDuration(
                           summary.total.medianFirstMaintainerResponseHours,
                       ),
-                  ],
-                  [
-                      "曾为 Draft",
-                      analyzedOptions?.includeDraftHistory
-                          ? countAndRate(
-                                summary.total.everDraft,
-                                summary.total.draftKnown,
-                            )
-                          : `未启用历史（当前 ${summary.total.currentDraft}）`,
                   ],
                   [
                       "维护者最近回复",
@@ -2393,9 +2331,6 @@
         if (!analysis.coverage.fullHistory) {
             warnings.push("贡献者活动计数只覆盖 Open 对象；首次身份使用 GitHub 关联字段");
         }
-        if (!analysis.coverage.draftHistory) {
-            warnings.push("非当前 Draft 的历史状态未知");
-        }
         const warning = warnings.length ? `；覆盖说明：${warnings.join("；")}` : "";
         const quotas = formatRateLimits();
         const rateLimit = quotas ? `；${quotas}` : "";
@@ -2437,7 +2372,6 @@
         ui.scopeOpen.disabled = value;
         ui.includeIssues.disabled = value;
         ui.includeCommits.disabled = value;
-        ui.includeDraftHistory.disabled = value;
         ui.completeInteractions.disabled = value;
         ui.export.disabled = value || !analysis;
         ui.analyze.textContent = value ? "分析中…" : "重新分析";
@@ -2447,7 +2381,6 @@
         return {
             includeIssues: ui.includeIssues.checked,
             includeCommits: ui.includeCommits.checked,
-            includeDraftHistory: ui.includeDraftHistory.checked,
             completeInteractions: ui.completeInteractions.checked,
         };
     }
@@ -2531,7 +2464,7 @@
                 ? " + 完整互动 REST"
                 : "（不扫描行内评论）"
         }`;
-        const modules = `模块：Issue ${requestedOptions.includeIssues ? "开" : "关"}，Commit ${requestedOptions.includeCommits ? "开" : "关"}，曾经 Draft ${requestedOptions.includeDraftHistory ? "开" : "关"}，完整互动 ${requestedOptions.completeInteractions ? "开" : "关"}`;
+        const modules = `模块：Issue ${requestedOptions.includeIssues ? "开" : "关"}，Commit ${requestedOptions.includeCommits ? "开" : "关"}，完整互动 ${requestedOptions.completeInteractions ? "开" : "关"}`;
         lastRateLimits = { graphql: null, rest: null };
         lastUsage = {
             graphqlPoints: 0,
@@ -2874,7 +2807,6 @@
               <div class="options" aria-label="分析模块">
                 <label><input id="include-issues" type="checkbox" checked>Issue 统计</label>
                 <label><input id="include-commits" type="checkbox" checked>Commit 概览（1 REST）</label>
-                <label title="读取 Draft/Ready 时间线，约增加 1 GraphQL point/100 PR"><input id="include-draft-history" type="checkbox">曾经 Draft</label>
                 <label title="Open 模式至少每个 PR 一次 REST；全部历史按每 100 条行内评论一次 REST"><input id="complete-interactions" type="checkbox">完整互动（高成本）</label>
               </div>
               <p id="status">请选择范围和选项，然后点击“开始分析”</p>
@@ -2951,7 +2883,6 @@
             scopeOpen: get("#scope-open"),
             includeIssues: get("#include-issues"),
             includeCommits: get("#include-commits"),
-            includeDraftHistory: get("#include-draft-history"),
             completeInteractions: get("#complete-interactions"),
             status: get("#status"),
             progressWrap: get("#progress-wrap"),
@@ -3010,7 +2941,6 @@
         for (const input of [
             ui.includeIssues,
             ui.includeCommits,
-            ui.includeDraftHistory,
             ui.completeInteractions,
         ]) {
             input.addEventListener("change", saveOptions);
