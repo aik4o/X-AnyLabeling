@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.3.1
+// @version      0.3.2
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -26,6 +26,8 @@
         includeDraftHistory: false,
         completeInteractions: false,
     });
+    const RESOURCE_PAGE_SIZE = 100;
+    const INTERACTION_PREVIEW_SIZE = 20;
     const DAY_MS = 24 * 60 * 60 * 1000;
     const HAN_PATTERN = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/u;
     const MAINTAINER_ASSOCIATIONS = new Set([
@@ -47,7 +49,7 @@
         ) {
           repository(owner: $owner, name: $name) {
             pullRequests(
-              first: 100
+              first: ${RESOURCE_PAGE_SIZE}
               after: $prCursor
               states: $prStates
               orderBy: {field: CREATED_AT, direction: ASC}
@@ -72,7 +74,7 @@
                     }
                   }
                 }
-                comments(first: 100) {
+                comments(first: ${INTERACTION_PREVIEW_SIZE}) {
                   totalCount
                   pageInfo { hasNextPage }
                   nodes {
@@ -82,7 +84,7 @@
                     createdAt updatedAt
                   }
                 }
-                reviews(first: 100) {
+                reviews(first: ${INTERACTION_PREVIEW_SIZE}) {
                   totalCount
                   pageInfo { hasNextPage }
                   nodes {
@@ -93,7 +95,7 @@
                   }
                 }
                 timelineItems(
-                  first: 100
+                  first: ${INTERACTION_PREVIEW_SIZE}
                   itemTypes: [
                     CONVERT_TO_DRAFT_EVENT
                     READY_FOR_REVIEW_EVENT
@@ -109,7 +111,7 @@
               }
             }
             issues(
-              first: 100
+              first: ${RESOURCE_PAGE_SIZE}
               after: $issueCursor
               states: $issueStates
               orderBy: {field: CREATED_AT, direction: ASC}
@@ -129,7 +131,7 @@
                 closedByPullRequestsReferences(first: 1, includeClosedPrs: true) {
                   totalCount
                 }
-                comments(first: 100) {
+                comments(first: ${INTERACTION_PREVIEW_SIZE}) {
                   totalCount
                   pageInfo { hasNextPage }
                   nodes {
@@ -772,6 +774,12 @@
         return `${name} 额度：已用 ${value.used}/${value.limit}（剩余 ${value.remaining}）`;
     }
 
+    function responseHeader(response, name) {
+        return String(response.responseHeaders || "").match(
+            new RegExp(`^${name}:\\s*(.+?)\\s*$`, "im"),
+        )?.[1];
+    }
+
     function rateLimitFromHeaders(rawHeaders) {
         const readNumber = (name) => {
             const match = String(rawHeaders || "").match(
@@ -816,11 +824,15 @@
 
     function formatApiError(message, response) {
         const rateLimit = rateLimitFromHeaders(response.responseHeaders);
-        return rateLimit
-            ? `${message}；${formatRateLimit(rateLimit)}，重置时间 ${formatDate(
-                  rateLimit.resetAt,
-              )}`
-            : message;
+        const requestId = responseHeader(response, "x-github-request-id");
+        const details = [message];
+        if (requestId) details.push(`GitHub Request ID ${requestId}`);
+        if (rateLimit) {
+            details.push(
+                `${formatRateLimit(rateLimit)}，重置时间 ${formatDate(rateLimit.resetAt)}`,
+            );
+        }
+        return details.join("；");
     }
 
     function parseRepository() {
@@ -855,9 +867,47 @@
                     try {
                         payload = JSON.parse(response.responseText);
                     } catch (_error) {
+                        const responseText = String(
+                            response.responseText || "",
+                        );
+                        const preview = responseText
+                            .trim()
+                            .replace(/\s+/g, " ")
+                            .slice(0, 160);
+                        const details = [
+                            `HTTP ${response.status || "未知状态"}${
+                                response.statusText
+                                    ? ` ${response.statusText}`
+                                    : ""
+                            }`,
+                            `响应 ${responseText.length} 字符`,
+                        ];
+                        const contentType = responseHeader(
+                            response,
+                            "content-type",
+                        );
+                        const requestId = responseHeader(
+                            response,
+                            "x-github-request-id",
+                        );
+                        if (contentType) {
+                            details.push(`Content-Type ${contentType}`);
+                        }
+                        if (requestId) {
+                            details.push(`GitHub Request ID ${requestId}`);
+                        }
+                        const rateLimit = rateLimitFromHeaders(
+                            response.responseHeaders,
+                        );
+                        if (rateLimit) {
+                            details.push(
+                                `${formatRateLimit(rateLimit)}，重置时间 ${formatDate(rateLimit.resetAt)}`,
+                            );
+                        }
+                        if (preview) details.push(`响应摘要：${preview}`);
                         reject(
                             new Error(
-                                `GitHub GraphQL 返回了非 JSON 响应 (${response.status || "未知状态"})；通常是查询过大或 GitHub 网关暂时失败`,
+                                `GitHub GraphQL 返回非 JSON；${details.join("；")}`,
                             ),
                         );
                         return;
@@ -1231,34 +1281,68 @@
         let prTotal = null;
         let issueTotal = selectedOptions.includeIssues ? null : 0;
         let page = 0;
+        let prPage = 0;
+        let issuePage = 0;
         const combineResources = selectedScope === "open";
 
         while (fetchPulls || fetchIssues) {
             // 全量历史的嵌套评论响应可能很大。Open 通常很小，仍合并为
             // 一次请求；全量模式按 PR、Issue 分开分页，避免 GitHub 网关
-            // 返回非 JSON，同时保持每页 100 条。
+            // 返回非 JSON。嵌套互动只预取常见的前 20 条，溢出数据可用
+            // “完整互动”选项补全。
             const requestPulls = fetchPulls;
             const requestIssues =
                 fetchIssues && (combineResources || !fetchPulls);
-            const data = await requestGraphQL(REPOSITORY_QUERY, token, {
-                owner: repository.owner,
-                name: repository.name,
-                prCursor,
-                issueCursor,
-                prStates:
-                    selectedScope === "open"
-                        ? ["OPEN"]
-                        : ["OPEN", "CLOSED", "MERGED"],
-                issueStates:
-                    selectedScope === "open" ? ["OPEN"] : ["OPEN", "CLOSED"],
-                fetchPulls: requestPulls,
-                fetchIssues: requestIssues,
-                includeDraftHistory: selectedOptions.includeDraftHistory,
-            });
+            const requestParts = [];
+            if (requestPulls) {
+                requestParts.push(
+                    `PR 第 ${prPage + 1} 页（${prCursor ? "续页" : "首页"}）`,
+                );
+            }
+            if (requestIssues) {
+                requestParts.push(
+                    `Issue 第 ${issuePage + 1} 页（${issueCursor ? "续页" : "首页"}）`,
+                );
+            }
+            const requestLabel = requestParts.join(" + ");
+            onProgress(
+                `准备请求 GraphQL ${requestLabel}；对象上限 ${RESOURCE_PAGE_SIZE}/页；每个互动连接上限 ${INTERACTION_PREVIEW_SIZE} 条；Draft 时间线${selectedOptions.includeDraftHistory ? "开启" : "关闭"}`,
+                null,
+            );
+            const requestStartedAt = Date.now();
+            let data;
+            try {
+                data = await requestGraphQL(REPOSITORY_QUERY, token, {
+                    owner: repository.owner,
+                    name: repository.name,
+                    prCursor,
+                    issueCursor,
+                    prStates:
+                        selectedScope === "open"
+                            ? ["OPEN"]
+                            : ["OPEN", "CLOSED", "MERGED"],
+                    issueStates:
+                        selectedScope === "open"
+                            ? ["OPEN"]
+                            : ["OPEN", "CLOSED"],
+                    fetchPulls: requestPulls,
+                    fetchIssues: requestIssues,
+                    includeDraftHistory: selectedOptions.includeDraftHistory,
+                });
+            } catch (error) {
+                const seconds = (
+                    (Date.now() - requestStartedAt) /
+                    1000
+                ).toFixed(1);
+                throw new Error(
+                    `GraphQL ${requestLabel}失败；耗时 ${seconds} 秒；未自动重试，以避免失败请求重复消耗额度；${error.message || String(error)}`,
+                );
+            }
             if (!data.repository) {
                 throw new Error("仓库不存在，或 Token 没有读取权限");
             }
             if (requestPulls) {
+                prPage += 1;
                 const connection = data.repository.pullRequests;
                 prTotal ??= connection.totalCount;
                 for (const node of connection.nodes) {
@@ -1270,6 +1354,7 @@
                 fetchPulls = connection.pageInfo.hasNextPage;
             }
             if (requestIssues) {
+                issuePage += 1;
                 const connection = data.repository.issues;
                 issueTotal ??= connection.totalCount;
                 issues.push(...connection.nodes);
@@ -1291,7 +1376,7 @@
                 progress.push(`Issue ${issues.length}/${issueTotal ?? "?"}`);
             }
             onProgress(
-                `GraphQL 第 ${page} 次请求完成；${progress.join("，")}；cost ${rateLimit.cost}`,
+                `GraphQL 第 ${page} 次请求完成；${progress.join("，")}；cost ${rateLimit.cost}；耗时 ${((Date.now() - requestStartedAt) / 1000).toFixed(1)} 秒`,
                 rateLimit,
             );
         }
@@ -1448,7 +1533,10 @@
         const issueCount = analysis?.issueRows.length || 0;
         const usage = analysis?.usage || lastUsage;
         const costOptions = selectedOptions();
-        const draftEstimate = Math.max(1, Math.ceil(prCount / 100));
+        const draftEstimate = Math.max(
+            1,
+            Math.ceil(prCount / RESOURCE_PAGE_SIZE),
+        );
         const rows = [
             [
                 "PR 标题/正文/作者/状态/时间/改动量/当前 Draft/stale",
@@ -1458,11 +1546,11 @@
                 "低",
             ],
             [
-                "PR 普通评论、修改时间、Reviews、PR commit 数",
+                `PR 前 ${INTERACTION_PREVIEW_SIZE} 条普通评论/Reviews、修改时间、PR commit 数`,
                 "主 GraphQL 嵌套连接",
                 "否",
-                "约 3 points / 100 PR；与主查询合并",
-                "中",
+                "实际 cost 见日志；与主查询合并",
+                "低-中",
             ],
             [
                 "曾经 Draft",
@@ -1479,18 +1567,18 @@
                 "高/可变",
             ],
             [
-                "超过 100 条的评论或 Review",
+                `超过前 ${INTERACTION_PREVIEW_SIZE} 条的评论或 Review`,
                 "仅对溢出对象 REST 分页",
                 "是",
                 `实际 ${usage.overflowRest || 0} 请求；每 100 条 1 请求`,
                 "可变",
             ],
             [
-                "Issue 基础字段、标签、关闭 PR、前 100 条评论",
+                `Issue 基础字段、标签、关闭 PR、前 ${INTERACTION_PREVIEW_SIZE} 条评论`,
                 "与 PR 主 GraphQL 合并",
                 "模块可选",
-                `约 3 points / 100 Issue；本次 ${issueCount} 个`,
-                "中",
+                `实际 cost 见日志；本次 ${issueCount} 个`,
+                "低-中",
             ],
             [
                 "贡献者最近活跃、PR/评论/Review 数和身份",
@@ -1797,7 +1885,9 @@
             warnings.push("未取行内 Review 评论，回复率可能是下限");
         }
         if (overflowItems.length) {
-            warnings.push(`${overflowItems.slice(0, 8).join("、")} 数据溢出`);
+            warnings.push(
+                `${overflowItems.slice(0, 8).join("、")} 超过默认预取 ${INTERACTION_PREVIEW_SIZE} 条；启用“完整互动”可补全`,
+            );
         }
         if (!analysis.coverage.fullHistory) {
             warnings.push("贡献者活动计数只覆盖 Open 对象；首次身份使用 GitHub 关联字段");
@@ -1887,12 +1977,13 @@
         const graphQlStrategy =
             requestedScope === "open"
                 ? "合并 PR/Issue GraphQL 分页"
-                : "PR/Issue 分离 GraphQL 分页（每页 100）";
+                : `PR/Issue 分离 GraphQL 分页（每页 ${RESOURCE_PAGE_SIZE}）`;
         const strategy = `${graphQlStrategy} + 单次 Commit 统计${
             requestedOptions.completeInteractions
                 ? " + 完整互动 REST"
                 : "（不扫描行内评论）"
         }`;
+        const modules = `模块：Issue ${requestedOptions.includeIssues ? "开" : "关"}，Commit ${requestedOptions.includeCommits ? "开" : "关"}，曾经 Draft ${requestedOptions.includeDraftHistory ? "开" : "关"}，完整互动 ${requestedOptions.completeInteractions ? "开" : "关"}`;
         lastRateLimits = { graphql: null, rest: null };
         lastUsage = {
             graphqlPoints: 0,
@@ -1911,7 +2002,7 @@
         setStatus(
             `开始分析 ${currentRepository.owner}/${currentRepository.name}；范围：${
                 requestedScope === "open" ? "仅 Open" : "全部历史"
-            }；低额度策略：${strategy}`,
+            }；低额度策略：${strategy}；${modules}`,
         );
         try {
             const result = await fetchPullRequests(

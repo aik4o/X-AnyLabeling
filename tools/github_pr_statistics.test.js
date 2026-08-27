@@ -138,10 +138,12 @@ assert.equal(
 async function testAllHistorySplitsPullsAndIssues() {
     const requests = [];
     global.GM_xmlhttpRequest = ({ data, onload }) => {
-        const variables = JSON.parse(data).variables;
+        const payload = JSON.parse(data);
+        const variables = payload.variables;
         requests.push({
             fetchPulls: variables.fetchPulls,
             fetchIssues: variables.fetchIssues,
+            query: payload.query,
         });
         const repository = {};
         if (variables.fetchPulls) {
@@ -189,10 +191,18 @@ async function testAllHistorySplitsPullsAndIssues() {
         },
     );
 
-    assert.deepEqual(requests, [
-        { fetchPulls: true, fetchIssues: false },
-        { fetchPulls: false, fetchIssues: true },
-    ]);
+    assert.deepEqual(
+        requests.map(({ fetchPulls, fetchIssues }) => ({
+            fetchPulls,
+            fetchIssues,
+        })),
+        [
+            { fetchPulls: true, fetchIssues: false },
+            { fetchPulls: false, fetchIssues: true },
+        ],
+    );
+    assert.match(requests[0].query, /comments\(first: 20\)/);
+    assert.match(requests[0].query, /pullRequests\(\s+first: 100/);
 
     requests.length = 0;
     await stats.fetchPullRequests(
@@ -207,12 +217,55 @@ async function testAllHistorySplitsPullsAndIssues() {
             completeInteractions: false,
         },
     );
-    assert.deepEqual(requests, [
-        { fetchPulls: true, fetchIssues: true },
-    ]);
+    assert.deepEqual(
+        requests.map(({ fetchPulls, fetchIssues }) => ({
+            fetchPulls,
+            fetchIssues,
+        })),
+        [{ fetchPulls: true, fetchIssues: true }],
+    );
+}
+
+async function testGraphqlErrorDetails() {
+    const logs = [];
+    global.GM_xmlhttpRequest = ({ onload }) => {
+        onload({
+            status: 502,
+            statusText: "Bad Gateway",
+            responseHeaders:
+                "content-type: text/plain\r\nx-github-request-id: TEST:123\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 4940\r\nx-ratelimit-used: 60\r\nx-ratelimit-reset: 1773104400\r\nx-ratelimit-resource: graphql\r\n",
+            responseText: "upstream failure",
+        });
+    };
+
+    await assert.rejects(
+        stats.fetchPullRequests(
+            { owner: "o", name: "r" },
+            "token",
+            "all",
+            (message) => logs.push(message),
+            {
+                includeIssues: false,
+                includeCommits: false,
+                includeDraftHistory: false,
+                completeInteractions: false,
+            },
+        ),
+        (error) => {
+            assert.match(error.message, /PR 第 1 页.*耗时/);
+            assert.match(error.message, /HTTP 502 Bad Gateway/);
+            assert.match(error.message, /Content-Type text\/plain/);
+            assert.match(error.message, /GitHub Request ID TEST:123/);
+            assert.match(error.message, /已用 60\/5000/);
+            assert.match(error.message, /响应摘要：upstream failure/);
+            return true;
+        },
+    );
+    assert.match(logs[0], /对象上限 100\/页.*互动连接上限 20 条/);
 }
 
 testAllHistorySplitsPullsAndIssues()
+    .then(testGraphqlErrorDetails)
     .then(() => console.log("github_pr_statistics tests passed"))
     .catch((error) => {
         console.error(error);
