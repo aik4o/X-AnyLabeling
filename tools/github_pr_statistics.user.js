@@ -2,7 +2,7 @@
 // @name         GitHub PR 中英文统计
 // @name:en      GitHub PR Language Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.1.1
+// @version      0.1.2
 // @description  统计仓库中英文 PR 的合并率、提交者/维护者回复率和维护者最近回复时间
 // @description:en Analyze PR language, merge rate, reply rate, and latest maintainer reply
 // @match        https://github.com/*/*
@@ -511,6 +511,11 @@
     function setStatus(message, type = "") {
         ui.status.textContent = message;
         ui.status.dataset.type = type;
+        const time = new Date().toLocaleTimeString("zh-CN", {
+            hour12: false,
+        });
+        ui.log.append(document.createTextNode(`[${time}] ${message}\n`));
+        ui.log.scrollTop = ui.log.scrollHeight;
     }
 
     function setLoading(value) {
@@ -534,7 +539,11 @@
         setLoading(true);
         ui.cards.innerHTML = "";
         ui.table.innerHTML = "";
-        setStatus("正在连接 GitHub GraphQL API…");
+        setStatus(
+            `开始分析 ${currentRepository.owner}/${currentRepository.name}；范围：${
+                requestedScope === "open" ? "仅 Open" : "全部 PR"
+            }；PR 每页 100 个`,
+        );
         try {
             const result = await fetchPullRequests(
                 currentRepository,
@@ -542,7 +551,9 @@
                 requestedScope,
                 (count, page, rateLimit) => {
                     lastRateLimit = rateLimit;
-                    setStatus(`已读取 ${count} 个 PR（第 ${page} 页）…`);
+                    setStatus(
+                        `第 ${page} 页完成；累计 ${count} 个 PR；本页 cost ${rateLimit.cost}；API 剩余 ${rateLimit.remaining}`,
+                    );
                 },
             );
             analyzedRows = result.rows;
@@ -664,6 +675,7 @@
             #status { margin: 10px 0; color: var(--muted); overflow-wrap: anywhere; }
             #status[data-type="error"] { color: #cf222e; }
             #status[data-type="success"] { color: #1a7f37; }
+            #log { max-height: 160px; overflow: auto; margin: 8px 0 0; padding: 8px; color: var(--text); background: var(--muted-bg); border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
             #cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 8px; margin: 12px 0; }
             .card { min-width: 0; padding: 10px; background: var(--muted-bg); border: 1px solid var(--border); border-radius: 8px; }
             .card span { display: block; color: var(--muted); margin-bottom: 4px; }
@@ -709,6 +721,10 @@
               <p id="status">尚未分析</p>
               <div id="cards"></div>
               <div class="table-wrap"><table id="table"></table></div>
+              <details open>
+                <summary>分析日志</summary>
+                <pre id="log" role="log" aria-live="polite"></pre>
+              </details>
               <details id="settings">
                 <summary>GitHub Token 设置（<span id="token-state">未配置</span>）</summary>
                 <div class="token-row">
@@ -740,6 +756,7 @@
             scopeAll: get("#scope-all"),
             scopeOpen: get("#scope-open"),
             status: get("#status"),
+            log: get("#log"),
             cards: get("#cards"),
             table: get("#table"),
             settings: get("#settings"),
@@ -807,6 +824,7 @@
             analyzedScope = null;
             overflowPrs = [];
             lastRateLimit = null;
+            ui.log.textContent = "";
             ui.cards.innerHTML = "";
             ui.table.innerHTML = "";
             setStatus("尚未分析");
