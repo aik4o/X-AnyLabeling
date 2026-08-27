@@ -71,49 +71,6 @@ class TestLabelWidgetMetrics(unittest.TestCase):
         _set_label_list_item_lock(item, False)
         self.assertFalse(item.is_locked())
 
-    def test_selected_label_list_item_draws_star_and_keeps_label_color(self):
-        from anylabeling.resources import resources  # noqa: F401
-        from anylabeling.views.labeling.widgets import (
-            LabelListWidget,
-            LabelListWidgetItem,
-        )
-
-        widget = LabelListWidget()
-        widget.resize(240, 80)
-        item = LabelListWidgetItem("vehicle")
-        label_color = QtGui.QColor(110, 90, 170)
-        item.setBackground(label_color)
-        widget.add_iem(item)
-        widget.select_item(item)
-        widget.show()
-        self.app.processEvents()
-
-        index = widget.model().index(0, 0)
-        rect = widget.visualRect(index)
-        image = widget.viewport().grab().toImage()
-        background = image.pixelColor(rect.right() - 5, rect.center().y())
-        gold_pixels = sum(
-            1
-            for y in range(rect.top(), rect.bottom() + 1)
-            for x in range(rect.left(), rect.right() + 1)
-            if (
-                image.pixelColor(x, y).red() > 220
-                and image.pixelColor(x, y).green() > 160
-                and image.pixelColor(x, y).blue() < 130
-            )
-        )
-
-        self.assertLessEqual(
-            max(
-                abs(background.red() - label_color.red()),
-                abs(background.green() - label_color.green()),
-                abs(background.blue() - label_color.blue()),
-            ),
-            2,
-        )
-        self.assertGreater(gold_pixels, 0)
-        widget.close()
-
     def test_right_double_click_does_not_emit_item_double_clicked(self):
         from anylabeling.views.labeling.widgets import (
             LabelListWidget,

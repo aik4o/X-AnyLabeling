@@ -526,12 +526,6 @@ def get_dock_style() -> str:
         QListWidget::item:hover:!selected {{
             background-color: {t["surface_hover"]};
         }}
-        QListView#LabelList {{
-            background-color: {t["background"]};
-            color: {t["text"]};
-            border: none;
-            outline: none;
-        }}
         QListWidget#FileList::item {{
             padding: 1px 0;
             min-height: 18px;
