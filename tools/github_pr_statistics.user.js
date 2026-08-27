@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.5
+// @version      0.6.6
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.5";
+    const SCRIPT_VERSION = "0.6.6";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -143,6 +143,7 @@
     let analyzedScope = null;
     let analyzedOptions = null;
     let loading = false;
+    let pauseRequested = false;
     let fetchCheckpoint = null;
     let lastRateLimits = { graphql: null, rest: null };
     let lastUsage = {
@@ -876,6 +877,12 @@
         );
     }
 
+    function createPauseError() {
+        const error = new Error("用户已暂停读取");
+        error.paused = true;
+        return error;
+    }
+
     function requestGraphQL(query, token, variables) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -1084,12 +1091,18 @@
         return rateLimits;
     }
 
-    async function fetchRestPages(url, token, onPage) {
+    async function fetchRestPages(
+        url,
+        token,
+        onPage,
+        shouldPause = () => false,
+    ) {
         let page = 1;
         let total = 0;
         let hasNextPage = true;
         let rateLimit = null;
         while (hasNextPage) {
+            if (shouldPause()) throw createPauseError();
             const separator = url.includes("?") ? "&" : "?";
             const result = await requestRest(
                 token,
@@ -1138,18 +1151,24 @@
         usage,
         rateLimits,
         onProgress,
+        shouldPause,
     ) {
         const nodes = [];
-        await fetchRestPages(url, token, (items, page, total, rateLimit) => {
-            usage.restRequests += 1;
-            usage.overflowRest += 1;
-            nodes.push(...items.map(normalize));
-            rateLimits.rest = rateLimit;
-            onProgress(
-                `${label}第 ${page} 页完成；累计 ${total} 条`,
-                rateLimit,
-            );
-        });
+        await fetchRestPages(
+            url,
+            token,
+            (items, page, total, rateLimit) => {
+                usage.restRequests += 1;
+                usage.overflowRest += 1;
+                nodes.push(...items.map(normalize));
+                rateLimits.rest = rateLimit;
+                onProgress(
+                    `${label}第 ${page} 页完成；累计 ${total} 条`,
+                    rateLimit,
+                );
+            },
+            shouldPause,
+        );
         item[key] = {
             totalCount: nodes.length,
             pageInfo: { hasNextPage: false },
@@ -1166,6 +1185,7 @@
         usage,
         rateLimits,
         onProgress,
+        shouldPause = () => false,
     ) {
         const owner = encodeURIComponent(repository.owner);
         const name = encodeURIComponent(repository.name);
@@ -1183,6 +1203,7 @@
                     usage,
                     rateLimits,
                     onProgress,
+                    shouldPause,
                 );
             }
             if (pr.reviews?.pageInfo?.hasNextPage) {
@@ -1196,6 +1217,7 @@
                     usage,
                     rateLimits,
                     onProgress,
+                    shouldPause,
                 );
             }
         }
@@ -1211,6 +1233,7 @@
                     usage,
                     rateLimits,
                     onProgress,
+                    shouldPause,
                 );
             }
         }
@@ -1241,6 +1264,7 @@
                         rateLimit,
                     );
                 },
+                shouldPause,
             );
         } else {
             for (const pr of pullRequests) {
@@ -1259,6 +1283,7 @@
                             rateLimit,
                         );
                     },
+                    shouldPause,
                 );
             }
         }
@@ -1326,6 +1351,7 @@
         startingRateLimits = null,
         resumeState = null,
         onCheckpoint = () => {},
+        shouldPause = () => false,
     ) {
         const selectedOptions = { ...DEFAULT_OPTIONS, ...requestedOptions };
         const checkpointKey = fetchCheckpointKey(
@@ -1407,6 +1433,11 @@
             }
             onCheckpoint(state);
         };
+        const stopIfPaused = () => {
+            if (!shouldPause()) return;
+            saveCheckpoint();
+            throw createPauseError();
+        };
 
         saveCheckpoint();
         if (resume) {
@@ -1417,6 +1448,7 @@
         }
 
         while (fetchPulls || fetchIssues) {
+            stopIfPaused();
             // 全量历史的嵌套评论响应可能很大。Open 通常很小，仍合并为
             // 一次请求；全量模式按 PR、Issue 分开分页，避免 GitHub 网关
             // 返回非 JSON。嵌套互动只预取较小的元数据窗口，溢出数据可用
@@ -1439,6 +1471,7 @@
             let data;
             let requestSeconds;
             while (true) {
+                stopIfPaused();
                 onProgress(
                     `准备请求 GraphQL ${requestLabel}；对象上限 ${pageSize}/页；每个互动连接上限 ${INTERACTION_PREVIEW_SIZE} 条元数据（不含正文）`,
                     null,
@@ -1622,6 +1655,7 @@
                 pageSize = nextPageSize;
             }
             saveCheckpoint();
+            stopIfPaused();
         }
 
         if (selectedOptions.completeInteractions) {
@@ -1642,11 +1676,14 @@
                 usage,
                 rateLimits,
                 onProgress,
+                shouldPause,
             );
+            stopIfPaused();
         }
 
         let commitResult = { entries: null, status: null };
         if (selectedOptions.includeCommits) {
+            stopIfPaused();
             onProgress("开始读取 Commit 贡献者统计", null, {
                 value: null,
                 label: "读取数据：Commit 贡献者统计",
@@ -1658,6 +1695,7 @@
                 rateLimits,
                 onProgress,
             );
+            stopIfPaused();
         }
 
         // ponytail: exact inline comments are opt-in because Open scope costs at
@@ -2494,6 +2532,8 @@
     function setLoading(value) {
         loading = value;
         ui.analyze.disabled = value;
+        ui.pause.disabled = !value || pauseRequested;
+        if (!value) ui.pause.textContent = "暂停";
         ui.refreshRateLimits.disabled = value;
         ui.scopeAll.disabled = value;
         ui.scopeOpen.disabled = value;
@@ -2516,6 +2556,14 @@
               : analysis
                 ? "重新分析"
                 : "开始分析";
+    }
+
+    function requestPause() {
+        if (!loading || pauseRequested) return;
+        pauseRequested = true;
+        ui.pause.disabled = true;
+        ui.pause.textContent = "暂停中…";
+        setStatus("已请求暂停；当前 API 请求完成并保存检查点后停止");
     }
 
     function selectedOptions() {
@@ -2635,6 +2683,7 @@
         analyzedScope = null;
         analyzedOptions = null;
         overflowItems = [];
+        pauseRequested = false;
         setLoading(true);
         resetOutput();
         setProgress(null, "读取数据：准备请求 GitHub API");
@@ -2680,6 +2729,7 @@
                 (checkpoint) => {
                     fetchCheckpoint = checkpoint;
                 },
+                () => pauseRequested,
             );
             lastUsage = fetchedData.usage;
             setProgress(null, "读取数据：复核 GitHub 实时额度");
@@ -2701,6 +2751,8 @@
                     `GitHub 实时额度复核失败；不使用本地累计值代替；${error.message || String(error)}`,
                 );
             }
+            if (pauseRequested) throw createPauseError();
+            ui.pause.disabled = true;
             setProgress(100, "原始数据读取完成");
             setStatus(
                 `原始数据读取完成：${fetchedData.raw.pullRequests.length} 个 PR、${fetchedData.raw.issues.length} 个 Issue；所有 GitHub API 请求已结束，开始本地分析`,
@@ -2728,6 +2780,23 @@
             const currentProgress = ui.progress.hasAttribute("value")
                 ? ui.progress.value
                 : 0;
+            if (error.paused) {
+                let checkpointDetails = "";
+                if (fetchCheckpoint) {
+                    try {
+                        GM_setValue(CHECKPOINT_KEY, fetchCheckpoint);
+                        checkpointDetails = `；检查点已保存：PR ${fetchCheckpoint.pullRequests?.length || 0}/${fetchCheckpoint.prTotal ?? "?"}、Issue ${fetchCheckpoint.issues?.length || 0}/${fetchCheckpoint.issueTotal ?? "?"}`;
+                    } catch (checkpointError) {
+                        checkpointDetails = `；检查点持久化失败，但当前页面仍可继续：${checkpointError.message || String(checkpointError)}`;
+                    }
+                }
+                setProgress(currentProgress, "读取已暂停");
+                setStatus(
+                    `分析已暂停${checkpointDetails}；点击“继续分析”从未完成页继续`,
+                    "success",
+                );
+                return;
+            }
             if (phase === "analysis") {
                 let checkpointDetails = "";
                 if (fetchCheckpoint) {
@@ -2771,6 +2840,7 @@
                 "error",
             );
         } finally {
+            pauseRequested = false;
             setLoading(false);
         }
     }
@@ -2983,6 +3053,7 @@
                   <button id="scope-open">仅 Open</button>
                 </div>
                 <button id="analyze" class="button primary">开始分析</button>
+                <button id="pause" class="button" disabled>暂停</button>
                 <button id="refresh-rate-limits" class="button">刷新实际额度</button>
                 <button id="export" class="button" disabled>导出 JSON</button>
               </div>
@@ -3044,7 +3115,7 @@
                 中文判定：标题或原始正文任一处含中文。主 GraphQL 查询只请求评论/Review 的作者、身份关系、发布时间和修改时间，不请求正文；“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
                 stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
                 核心贡献者默认指内部成员，或达到 5 个合并 PR、10 次 Review、20 个 Commit 任一阈值。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
-                执行流程严格分为“读取原始数据”和“本地分析”两个阶段；只有读取阶段访问 GitHub API，本地分析每处理 50 条更新一次日志和进度条。
+                执行流程严格分为“读取原始数据”和“本地分析”两个阶段；只有读取阶段访问 GitHub API，本地分析每处理 50 条更新一次日志和进度条。点击“暂停”会等待当前 API 请求完成，再保存检查点并停止。
               </p>
             </main>
           </section>
@@ -3059,6 +3130,7 @@
             title: get("#title"),
             close: get("#close"),
             analyze: get("#analyze"),
+            pause: get("#pause"),
             refreshRateLimits: get("#refresh-rate-limits"),
             export: get("#export"),
             scopeAll: get("#scope-all"),
@@ -3114,6 +3186,7 @@
             ui.launcher.setAttribute("aria-expanded", "false");
         });
         ui.analyze.addEventListener("click", runAnalysis);
+        ui.pause.addEventListener("click", requestPause);
         ui.refreshRateLimits.addEventListener("click", refreshRateLimits);
         ui.export.addEventListener("click", exportAnalysis);
         ui.scopeAll.addEventListener("click", () => setScope("all"));

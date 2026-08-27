@@ -13,6 +13,11 @@ assert.match(
     userscriptSource,
     /ui\.analyze\.addEventListener\("click", runAnalysis\)/,
 );
+assert.match(userscriptSource, /<button id="pause"[^>]*>暂停<\/button>/);
+assert.match(
+    userscriptSource,
+    /ui\.pause\.addEventListener\("click", requestPause\)/,
+);
 assert.doesNotMatch(
     userscriptSource,
     /isDraft|includeDraftHistory|CONVERT_TO_DRAFT_EVENT|READY_FOR_REVIEW_EVENT/,
@@ -382,7 +387,7 @@ async function testGraphqlErrorDetails() {
     assert.match(logs[0], /对象上限 100\/页.*互动连接上限 10 条元数据/);
 }
 
-async function testGraphqlResumeFromCheckpoint() {
+async function testGraphqlPauseAndResumeFromCheckpoint() {
     const resetAt = "2026-03-10T01:00:00Z";
     const startingRateLimits = {
         rest: null,
@@ -401,6 +406,7 @@ async function testGraphqlResumeFromCheckpoint() {
     };
     let checkpoint = null;
     let request = 0;
+    let shouldPause = false;
     global.GM_xmlhttpRequest = ({ data, onload }) => {
         request += 1;
         const variables = JSON.parse(data).variables;
@@ -433,14 +439,7 @@ async function testGraphqlResumeFromCheckpoint() {
             });
             return;
         }
-        assert.equal(variables.prCursor, "cursor-1");
-        onload({
-            status: 200,
-            responseHeaders: "",
-            responseText: JSON.stringify({
-                errors: [{ message: "permanent test interruption" }],
-            }),
-        });
+        assert.fail("暂停后不应请求下一页");
     };
 
     await assert.rejects(
@@ -454,10 +453,13 @@ async function testGraphqlResumeFromCheckpoint() {
             null,
             (state) => {
                 checkpoint = state;
+                if (state.prPage === 1) shouldPause = true;
             },
+            () => shouldPause,
         ),
-        /permanent test interruption/,
+        (error) => error.paused === true,
     );
+    assert.equal(request, 1);
     assert.equal(checkpoint.pullRequests.length, 1);
     assert.equal(checkpoint.prCursor, "cursor-1");
     assert.equal(checkpoint.prPage, 1);
@@ -779,7 +781,7 @@ async function testRateLimitLookup() {
 testSeparatedLocalAnalysis()
     .then(testAllHistorySplitsPullsAndIssues)
     .then(testGraphqlErrorDetails)
-    .then(testGraphqlResumeFromCheckpoint)
+    .then(testGraphqlPauseAndResumeFromCheckpoint)
     .then(testSafeGraphqlPageFallback)
     .then(testPageSizeDropsAndRecoversByTen)
     .then(testRateLimitLookup)
