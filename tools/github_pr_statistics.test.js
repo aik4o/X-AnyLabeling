@@ -17,6 +17,23 @@ assert.doesNotMatch(
     userscriptSource,
     /isDraft|includeDraftHistory|CONVERT_TO_DRAFT_EVENT|READY_FOR_REVIEW_EVENT/,
 );
+assert.match(userscriptSource, /let scope = "all";/);
+assert.match(
+    userscriptSource,
+    /<button id="scope-all" class="active">全部历史<\/button>/,
+);
+assert.match(
+    userscriptSource,
+    /GitHub 实时额度复核失败；不使用本地累计值代替/,
+);
+assert.match(
+    userscriptSource,
+    /本次脚本数据请求（本地计数，不是账户额度）/,
+);
+assert.match(
+    userscriptSource,
+    /lastUsage = fetchedData\.usage;[\s\S]*lastRateLimits = await fetchRateLimits\(token\);[\s\S]*fetchedData\.rateLimits = lastRateLimits;/,
+);
 
 const pr = {
     number: 7,
@@ -573,9 +590,12 @@ async function testPageSizeDropsAndRecoversByTen() {
 }
 
 async function testRateLimitLookup() {
-    global.GM_xmlhttpRequest = ({ method, url, onload }) => {
+    global.GM_xmlhttpRequest = ({ method, url, headers, nocache, onload }) => {
         assert.equal(method, "GET");
         assert.equal(url, "https://api.github.com/rate_limit");
+        assert.equal(nocache, true);
+        assert.equal(headers["Cache-Control"], "no-cache");
+        assert.equal(headers.Pragma, "no-cache");
         onload({
             status: 200,
             responseHeaders: "",

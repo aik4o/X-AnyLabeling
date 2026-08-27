@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.2
+// @version      0.6.3
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -136,7 +136,7 @@
     let ui;
     let currentRepository;
     let analysis = null;
-    let scope = "open";
+    let scope = "all";
     let analyzedScope = null;
     let analyzedOptions = null;
     let loading = false;
@@ -950,7 +950,9 @@
                     Accept: "application/vnd.github+json",
                     Authorization: `Bearer ${token}`,
                     "X-GitHub-Api-Version": "2026-03-10",
+                    ...(options.headers || {}),
                 },
+                nocache: options.nocache === true,
                 timeout: 30000,
                 onload(response) {
                     let payload = null;
@@ -1010,7 +1012,14 @@
         const result = await requestRest(
             token,
             "https://api.github.com/rate_limit",
-            { expectArray: false },
+            {
+                expectArray: false,
+                nocache: true,
+                headers: {
+                    "Cache-Control": "no-cache",
+                    Pragma: "no-cache",
+                },
+            },
         );
         const normalize = (value, resource) => {
             const limit = Number(value?.limit);
@@ -2333,8 +2342,10 @@
         }
         const warning = warnings.length ? `；覆盖说明：${warnings.join("；")}` : "";
         const quotas = formatRateLimits();
-        const rateLimit = quotas ? `；${quotas}` : "";
-        const usage = `；本次消耗 GraphQL ${lastUsage.graphqlPoints} points / ${lastUsage.graphqlRequests} 次请求，REST ${lastUsage.restRequests} 次请求`;
+        const rateLimit = quotas
+            ? `；GitHub /rate_limit 实时额度：${quotas}`
+            : "；GitHub /rate_limit 实时额度：查询失败";
+        const usage = `；本次脚本数据请求（本地计数，不是账户额度）：GraphQL ${lastUsage.graphqlPoints} points / ${lastUsage.graphqlRequests} 次，计费 REST ${lastUsage.restRequests} 次`;
         setStatus(
             `已分析 ${analysis.rows.length} 个 PR、${analysis.issueRows.length} 个 Issue；当前显示 ${total} 个 PR${warning}${usage}${rateLimit}`,
             "success",
@@ -2430,7 +2441,7 @@
         try {
             lastRateLimits = await fetchRateLimits(token);
             setStatus(
-                `额度查询完成（不消耗 REST 主额度）；${formatRateLimits()}`,
+                `GitHub 实时额度查询完成（不消耗 REST 主额度）；${formatRateLimits()}`,
                 "success",
             );
         } catch (error) {
@@ -2520,24 +2531,24 @@
                 requestedOptions,
                 baselineRateLimits,
             );
-            lastRateLimits = {
-                rest:
-                    fetchedData.rateLimits.rest ||
-                    baselineRateLimits?.rest ||
-                    null,
-                graphql:
-                    fetchedData.rateLimits.graphql ||
-                    baselineRateLimits?.graphql ||
-                    null,
-            };
             lastUsage = fetchedData.usage;
-            const rateLimitChange = formatRateLimitChange(
-                baselineRateLimits,
-                lastRateLimits,
-            );
-            if (rateLimitChange) {
+            setProgress(null, "读取数据：复核 GitHub 实时额度");
+            setStatus("原始数据读取完成；正在通过 GitHub /rate_limit 复核实际额度");
+            try {
+                lastRateLimits = await fetchRateLimits(token);
+                fetchedData.rateLimits = lastRateLimits;
+                const rateLimitChange = formatRateLimitChange(
+                    baselineRateLimits,
+                    lastRateLimits,
+                );
                 setStatus(
-                    `数据读取完成后的额度；${formatRateLimits()}；${rateLimitChange}`,
+                    `GitHub 实时额度复核完成；${formatRateLimits()}${rateLimitChange ? `；${rateLimitChange}` : ""}`,
+                );
+            } catch (error) {
+                lastRateLimits = { graphql: null, rest: null };
+                fetchedData.rateLimits = lastRateLimits;
+                setStatus(
+                    `GitHub 实时额度复核失败；不使用本地累计值代替；${error.message || String(error)}`,
                 );
             }
             setProgress(100, "原始数据读取完成");
@@ -2797,11 +2808,11 @@
             <main>
               <div class="toolbar">
                 <div class="scope" aria-label="统计范围">
-                  <button id="scope-all">全部历史</button>
-                  <button id="scope-open" class="active">仅 Open</button>
+                  <button id="scope-all" class="active">全部历史</button>
+                  <button id="scope-open">仅 Open</button>
                 </div>
                 <button id="analyze" class="button primary">开始分析</button>
-                <button id="refresh-rate-limits" class="button">刷新额度</button>
+                <button id="refresh-rate-limits" class="button">刷新实际额度</button>
                 <button id="export" class="button" disabled>导出 JSON</button>
               </div>
               <div class="options" aria-label="分析模块">
