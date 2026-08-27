@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.4.1
+// @version      0.4.2
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -29,6 +29,8 @@
     const OPEN_PAGE_SIZES = Object.freeze([100, 50, 25, 10]);
     const HISTORY_PAGE_SIZES = Object.freeze([50, 25, 10]);
     const INTERACTION_PREVIEW_SIZE = 10;
+    // ponytail: 固定阈值足以避开当前网关超时；策略变化时再改为滚动估计。
+    const SLOW_QUERY_SECONDS = 8;
     const DAY_MS = 24 * 60 * 60 * 1000;
     const HAN_PATTERN = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/u;
     const MAINTAINER_ASSOCIATIONS = new Set([
@@ -1435,15 +1437,24 @@
                         checkedRateLimits.graphql || rateLimits.graphql;
                     const afterFailure = checkedRateLimits.graphql;
                     let unsafeReason = "";
+                    let safeReason = "";
                     if (!afterFailure) {
                         unsafeReason = "额度查询未返回 GraphQL 数据";
                     } else if (
                         beforeFailure.resetAt !== afterFailure.resetAt
                     ) {
-                        unsafeReason =
-                            "GraphQL 额度窗口已重置，无法证明失败请求未扣点";
+                        if (
+                            afterFailure.used === 0 &&
+                            afterFailure.remaining === afterFailure.limit
+                        ) {
+                            safeReason = `GraphQL 额度窗口已重置且新窗口为 0/${afterFailure.limit}，旧窗口消耗已失效，可安全重试`;
+                        } else {
+                            unsafeReason = `GraphQL 额度窗口已重置，但新窗口已用 ${afterFailure.used}/${afterFailure.limit}，无法排除失败请求已在新窗口扣点`;
+                        }
                     } else if (beforeFailure.used !== afterFailure.used) {
                         unsafeReason = `GraphQL 已用额度从 ${beforeFailure.used} 变为 ${afterFailure.used}，失败请求可能已扣点`;
+                    } else {
+                        safeReason = `/rate_limit 确认 GraphQL 已用额度仍为 ${afterFailure.used}/${afterFailure.limit}，失败请求未扣点`;
                     }
                     if (unsafeReason) {
                         throw new Error(
@@ -1452,7 +1463,7 @@
                     }
 
                     onProgress(
-                        `${failure}；/rate_limit 确认 GraphQL 已用额度仍为 ${afterFailure.used}/${afterFailure.limit}，失败请求未扣点；对象上限 ${pageSize} → ${nextPageSize}/页后自动重试`,
+                        `${failure}；${safeReason}；对象上限 ${pageSize} → ${nextPageSize}/页后自动重试`,
                         afterFailure,
                     );
                     pageSizeIndex += 1;
@@ -1499,6 +1510,18 @@
                 `GraphQL 第 ${page} 次请求完成；对象上限 ${pageSize}/页；${progress.join("，")}；cost ${rateLimit.cost}；耗时 ${requestSeconds} 秒`,
                 rateLimit,
             );
+            const nextPageSize = pageSizes[pageSizeIndex + 1];
+            if (
+                (fetchPulls || fetchIssues) &&
+                Number(requestSeconds) >= SLOW_QUERY_SECONDS &&
+                nextPageSize
+            ) {
+                onProgress(
+                    `本页耗时 ${requestSeconds} 秒，接近 GitHub 网关超时；后续页对象上限 ${pageSize} → ${nextPageSize}/页，不重试已成功页面`,
+                    null,
+                );
+                pageSizeIndex += 1;
+            }
         }
 
         if (selectedOptions.completeInteractions) {

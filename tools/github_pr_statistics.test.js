@@ -260,8 +260,8 @@ async function testGraphqlErrorDetails() {
                         },
                         graphql: {
                             limit: 5000,
-                            used: 0,
-                            remaining: 5000,
+                            used: 1,
+                            remaining: 4999,
                             reset: previousReset + 3600,
                         },
                     },
@@ -309,7 +309,10 @@ async function testGraphqlErrorDetails() {
             assert.match(error.message, /GitHub Request ID TEST:123/);
             assert.match(error.message, /已用 60\/5000/);
             assert.match(error.message, /响应摘要：upstream failure/);
-            assert.match(error.message, /额度窗口已重置.*无法证明/);
+            assert.match(
+                error.message,
+                /额度窗口已重置.*新窗口已用 1\/5000.*无法排除/,
+            );
             return true;
         },
     );
@@ -320,7 +323,8 @@ async function testGraphqlErrorDetails() {
 async function testSafeGraphqlPageFallback() {
     const logs = [];
     const pageSizes = [];
-    const reset = 1773104400;
+    const previousReset = 1773104400;
+    const reset = previousReset + 3600;
     const resetAt = new Date(reset * 1000).toISOString();
     global.GM_xmlhttpRequest = ({ url, data, onload }) => {
         if (url === "https://api.github.com/rate_limit") {
@@ -337,8 +341,8 @@ async function testSafeGraphqlPageFallback() {
                         },
                         graphql: {
                             limit: 5000,
-                            used: 100,
-                            remaining: 4900,
+                            used: 0,
+                            remaining: 5000,
                             reset,
                         },
                     },
@@ -376,9 +380,9 @@ async function testSafeGraphqlPageFallback() {
                     rateLimit: {
                         cost: 1,
                         limit: 5000,
-                        remaining: 4899,
+                        remaining: 4999,
                         resetAt,
-                        used: 101,
+                        used: 1,
                     },
                 },
             }),
@@ -402,7 +406,7 @@ async function testSafeGraphqlPageFallback() {
                 limit: 5000,
                 used: 100,
                 remaining: 4900,
-                resetAt,
+                resetAt: new Date(previousReset * 1000).toISOString(),
                 resource: "graphql",
             },
         },
@@ -411,8 +415,72 @@ async function testSafeGraphqlPageFallback() {
     assert.deepEqual(pageSizes, [50, 25]);
     assert.equal(result.usage.graphqlRequests, 1);
     assert.equal(result.usage.graphqlPoints, 1);
-    assert.match(logs.join("\n"), /失败请求未扣点/);
+    assert.match(
+        logs.join("\n"),
+        /额度窗口已重置且新窗口为 0\/5000.*可安全重试/,
+    );
     assert.match(logs.join("\n"), /对象上限 50 → 25\/页后自动重试/);
+}
+
+async function testSlowPageDownshiftsWithoutRetry() {
+    const logs = [];
+    const pageSizes = [];
+    const originalDateNow = Date.now;
+    const clockReads = [0, 8500, 8500, 8600];
+    let clockIndex = 0;
+    Date.now = () =>
+        clockReads[Math.min(clockIndex++, clockReads.length - 1)];
+    global.GM_xmlhttpRequest = ({ data, onload }) => {
+        const variables = JSON.parse(data).variables;
+        pageSizes.push(variables.pageSize);
+        const hasNextPage = pageSizes.length === 1;
+        onload({
+            status: 200,
+            responseHeaders: "",
+            responseText: JSON.stringify({
+                data: {
+                    repository: {
+                        pullRequests: {
+                            totalCount: 75,
+                            nodes: [],
+                            pageInfo: {
+                                hasNextPage,
+                                endCursor: hasNextPage ? "next" : null,
+                            },
+                        },
+                    },
+                    rateLimit: {
+                        cost: 1,
+                        limit: 5000,
+                        remaining: 5000 - pageSizes.length,
+                        resetAt: "2026-03-10T01:00:00Z",
+                        used: pageSizes.length,
+                    },
+                },
+            }),
+        });
+    };
+
+    try {
+        await stats.fetchPullRequests(
+            { owner: "o", name: "r" },
+            "token",
+            "all",
+            (message) => logs.push(message),
+            {
+                includeIssues: false,
+                includeCommits: false,
+                includeDraftHistory: false,
+                completeInteractions: false,
+            },
+        );
+    } finally {
+        Date.now = originalDateNow;
+    }
+
+    assert.deepEqual(pageSizes, [50, 25]);
+    assert.match(logs.join("\n"), /本页耗时 8\.5 秒.*接近 GitHub 网关超时/);
+    assert.match(logs.join("\n"), /后续页对象上限 50 → 25\/页/);
 }
 
 async function testRateLimitLookup() {
@@ -463,6 +531,7 @@ async function testRateLimitLookup() {
 testAllHistorySplitsPullsAndIssues()
     .then(testGraphqlErrorDetails)
     .then(testSafeGraphqlPageFallback)
+    .then(testSlowPageDownshiftsWithoutRetry)
     .then(testRateLimitLookup)
     .then(() => console.log("github_pr_statistics tests passed"))
     .catch((error) => {
