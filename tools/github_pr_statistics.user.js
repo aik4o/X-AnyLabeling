@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.0
+// @version      0.6.1
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -26,12 +26,11 @@
         includeDraftHistory: false,
         completeInteractions: false,
     });
-    const OPEN_PAGE_SIZES = Object.freeze([100, 50, 25, 10]);
-    const HISTORY_PAGE_SIZES = Object.freeze([50, 25, 10]);
+    const MAX_PAGE_SIZE = 100;
+    const MIN_PAGE_SIZE = 10;
+    const PAGE_SIZE_STEP = 10;
     const INTERACTION_PREVIEW_SIZE = 10;
     const ANALYSIS_BATCH_SIZE = 50;
-    // ponytail: 固定阈值足以避开当前网关超时；策略变化时再改为滚动估计。
-    const SLOW_QUERY_SECONDS = 8;
     const DAY_MS = 24 * 60 * 60 * 1000;
     const HAN_PATTERN = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/u;
     const MAINTAINER_ASSOCIATIONS = new Set([
@@ -1317,9 +1316,7 @@
         startingRateLimits = null,
     ) {
         const selectedOptions = { ...DEFAULT_OPTIONS, ...requestedOptions };
-        const pageSizes =
-            selectedScope === "open" ? OPEN_PAGE_SIZES : HISTORY_PAGE_SIZES;
-        let pageSizeIndex = 0;
+        let pageSize = MAX_PAGE_SIZE;
         const pullRequests = [];
         const issues = [];
         const rateLimits = {
@@ -1366,10 +1363,8 @@
             }
             const requestLabel = requestParts.join(" + ");
             let data;
-            let pageSize;
             let requestSeconds;
             while (true) {
-                pageSize = pageSizes[pageSizeIndex];
                 onProgress(
                     `准备请求 GraphQL ${requestLabel}；对象上限 ${pageSize}/页；每个互动连接上限 ${INTERACTION_PREVIEW_SIZE} 条元数据（不含正文）；Draft 时间线${selectedOptions.includeDraftHistory ? "开启" : "关闭"}`,
                     null,
@@ -1406,8 +1401,11 @@
                         1000
                     ).toFixed(1);
                     const failure = `GraphQL ${requestLabel}失败；对象上限 ${pageSize}/页；耗时 ${seconds} 秒`;
-                    const nextPageSize = pageSizes[pageSizeIndex + 1];
-                    if (error.status !== 502 || !nextPageSize) {
+                    const nextPageSize = Math.max(
+                        MIN_PAGE_SIZE,
+                        pageSize - PAGE_SIZE_STEP,
+                    );
+                    if (error.status !== 502 || nextPageSize === pageSize) {
                         const reason =
                             error.status === 502
                                 ? `已到最小对象上限 ${pageSize}/页`
@@ -1467,7 +1465,7 @@
                         `${failure}；${safeReason}；对象上限 ${pageSize} → ${nextPageSize}/页后自动重试`,
                         afterFailure,
                     );
-                    pageSizeIndex += 1;
+                    pageSize = nextPageSize;
                 }
             }
             if (!data?.repository) {
@@ -1529,17 +1527,16 @@
                     label: `读取数据：${progress.join("，")}`,
                 },
             );
-            const nextPageSize = pageSizes[pageSizeIndex + 1];
-            if (
-                (fetchPulls || fetchIssues) &&
-                Number(requestSeconds) >= SLOW_QUERY_SECONDS &&
-                nextPageSize
-            ) {
+            const nextPageSize = Math.min(
+                MAX_PAGE_SIZE,
+                pageSize + PAGE_SIZE_STEP,
+            );
+            if ((fetchPulls || fetchIssues) && nextPageSize !== pageSize) {
                 onProgress(
-                    `本页耗时 ${requestSeconds} 秒，接近 GitHub 网关超时；后续页对象上限 ${pageSize} → ${nextPageSize}/页，不重试已成功页面`,
+                    `本页成功；后续页对象上限 ${pageSize} → ${nextPageSize}/页`,
                     null,
                 );
-                pageSizeIndex += 1;
+                pageSize = nextPageSize;
             }
         }
 
@@ -1811,7 +1808,7 @@
         const costOptions = selectedOptions();
         const draftEstimate = Math.max(
             1,
-            Math.ceil(prCount / HISTORY_PAGE_SIZES[0]),
+            Math.ceil(prCount / MAX_PAGE_SIZE),
         );
         const rows = [
             [
@@ -2527,8 +2524,8 @@
         const requestedOptions = selectedOptions();
         const graphQlStrategy =
             requestedScope === "open"
-                ? `合并 PR/Issue GraphQL 自适应分页（${OPEN_PAGE_SIZES.join("→")}/页）`
-                : `PR/Issue 分离 GraphQL 自适应分页（${HISTORY_PAGE_SIZES.join("→")}/页）`;
+                ? `合并 PR/Issue GraphQL 自适应分页（初始 ${MAX_PAGE_SIZE}/页，失败 -${PAGE_SIZE_STEP}，成功 +${PAGE_SIZE_STEP}）`
+                : `PR/Issue 分离 GraphQL 自适应分页（初始 ${MAX_PAGE_SIZE}/页，失败 -${PAGE_SIZE_STEP}，成功 +${PAGE_SIZE_STEP}）`;
         const strategy = `${graphQlStrategy} + 单次 Commit 统计${
             requestedOptions.completeInteractions
                 ? " + 完整互动 REST"

@@ -265,8 +265,8 @@ async function testAllHistorySplitsPullsAndIssues() {
             pageSize,
         })),
         [
-            { fetchPulls: true, fetchIssues: false, pageSize: 50 },
-            { fetchPulls: false, fetchIssues: true, pageSize: 50 },
+            { fetchPulls: true, fetchIssues: false, pageSize: 100 },
+            { fetchPulls: false, fetchIssues: true, pageSize: 100 },
         ],
     );
     assert.match(requests[0].query, /comments\(first: 10\)/);
@@ -372,7 +372,7 @@ async function testGraphqlErrorDetails() {
         },
     );
     assert.equal(graphqlRequests, 1);
-    assert.match(logs[0], /对象上限 50\/页.*互动连接上限 10 条元数据/);
+    assert.match(logs[0], /对象上限 100\/页.*互动连接上限 10 条元数据/);
 }
 
 async function testSafeGraphqlPageFallback() {
@@ -467,28 +467,63 @@ async function testSafeGraphqlPageFallback() {
         },
     );
 
-    assert.deepEqual(pageSizes, [50, 25]);
+    assert.deepEqual(pageSizes, [100, 90]);
     assert.equal(result.usage.graphqlRequests, 1);
     assert.equal(result.usage.graphqlPoints, 1);
     assert.match(
         logs.join("\n"),
         /额度窗口已重置且新窗口为 0\/5000.*可安全重试/,
     );
-    assert.match(logs.join("\n"), /对象上限 50 → 25\/页后自动重试/);
+    assert.match(logs.join("\n"), /对象上限 100 → 90\/页后自动重试/);
 }
 
-async function testSlowPageDownshiftsWithoutRetry() {
+async function testPageSizeDropsAndRecoversByTen() {
     const logs = [];
     const pageSizes = [];
-    const originalDateNow = Date.now;
-    const clockReads = [0, 8500, 8500, 8600];
-    let clockIndex = 0;
-    Date.now = () =>
-        clockReads[Math.min(clockIndex++, clockReads.length - 1)];
-    global.GM_xmlhttpRequest = ({ data, onload }) => {
+    const reset = 1773104400;
+    const resetAt = new Date(reset * 1000).toISOString();
+    let graphqlAttempts = 0;
+    global.GM_xmlhttpRequest = ({ url, data, onload }) => {
+        if (url === "https://api.github.com/rate_limit") {
+            onload({
+                status: 200,
+                responseHeaders: "",
+                responseText: JSON.stringify({
+                    resources: {
+                        core: {
+                            limit: 5000,
+                            used: 0,
+                            remaining: 5000,
+                            reset,
+                        },
+                        graphql: {
+                            limit: 5000,
+                            used: 1,
+                            remaining: 4999,
+                            reset,
+                        },
+                    },
+                }),
+            });
+            return;
+        }
+
+        graphqlAttempts += 1;
         const variables = JSON.parse(data).variables;
         pageSizes.push(variables.pageSize);
-        const hasNextPage = pageSizes.length === 1;
+        if (graphqlAttempts === 2) {
+            onload({
+                status: 502,
+                statusText: "Bad Gateway",
+                responseHeaders: "content-type: text/html\r\n",
+                responseText: "<html>upstream failure</html>",
+            });
+            return;
+        }
+
+        const successfulPage =
+            graphqlAttempts === 1 ? 1 : graphqlAttempts - 1;
+        const hasNextPage = successfulPage < 4;
         onload({
             status: 200,
             responseHeaders: "",
@@ -496,46 +531,57 @@ async function testSlowPageDownshiftsWithoutRetry() {
                 data: {
                     repository: {
                         pullRequests: {
-                            totalCount: 75,
+                            totalCount: 4,
                             nodes: [],
                             pageInfo: {
                                 hasNextPage,
-                                endCursor: hasNextPage ? "next" : null,
+                                endCursor: hasNextPage
+                                    ? `next-${successfulPage}`
+                                    : null,
                             },
                         },
                     },
                     rateLimit: {
                         cost: 1,
                         limit: 5000,
-                        remaining: 5000 - pageSizes.length,
-                        resetAt: "2026-03-10T01:00:00Z",
-                        used: pageSizes.length,
+                        remaining: 5000 - successfulPage,
+                        resetAt,
+                        used: successfulPage,
                     },
                 },
             }),
         });
     };
 
-    try {
-        await stats.fetchRepositoryData(
-            { owner: "o", name: "r" },
-            "token",
-            "all",
-            (message) => logs.push(message),
-            {
-                includeIssues: false,
-                includeCommits: false,
-                includeDraftHistory: false,
-                completeInteractions: false,
+    await stats.fetchRepositoryData(
+        { owner: "o", name: "r" },
+        "token",
+        "all",
+        (message) => logs.push(message),
+        {
+            includeIssues: false,
+            includeCommits: false,
+            includeDraftHistory: false,
+            completeInteractions: false,
+        },
+        {
+            rest: null,
+            graphql: {
+                limit: 5000,
+                used: 0,
+                remaining: 5000,
+                resetAt,
+                resource: "graphql",
             },
-        );
-    } finally {
-        Date.now = originalDateNow;
-    }
+        },
+    );
 
-    assert.deepEqual(pageSizes, [50, 25]);
-    assert.match(logs.join("\n"), /本页耗时 8\.5 秒.*接近 GitHub 网关超时/);
-    assert.match(logs.join("\n"), /后续页对象上限 50 → 25\/页/);
+    assert.deepEqual(pageSizes, [100, 100, 90, 100, 100]);
+    assert.match(logs.join("\n"), /对象上限 100 → 90\/页后自动重试/);
+    assert.match(
+        logs.join("\n"),
+        /本页成功；后续页对象上限 90 → 100\/页/,
+    );
 }
 
 async function testRateLimitLookup() {
@@ -587,7 +633,7 @@ testSeparatedLocalAnalysis()
     .then(testAllHistorySplitsPullsAndIssues)
     .then(testGraphqlErrorDetails)
     .then(testSafeGraphqlPageFallback)
-    .then(testSlowPageDownshiftsWithoutRetry)
+    .then(testPageSizeDropsAndRecoversByTen)
     .then(testRateLimitLookup)
     .then(() => console.log("github_pr_statistics tests passed"))
     .catch((error) => {
