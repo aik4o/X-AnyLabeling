@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.5.0
+// @version      0.5.1
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -25,7 +25,6 @@
         includeCommits: true,
         includeDraftHistory: false,
         completeInteractions: false,
-        resumeIncomplete: true,
     });
     const OPEN_PAGE_SIZES = Object.freeze([100, 50, 25, 10]);
     const HISTORY_PAGE_SIZES = Object.freeze([50, 25, 10]);
@@ -33,9 +32,6 @@
     // ponytail: 固定阈值足以避开当前网关超时；策略变化时再改为滚动估计。
     const SLOW_QUERY_SECONDS = 8;
     const DAY_MS = 24 * 60 * 60 * 1000;
-    const CHECKPOINT_KEY_PREFIX = "github-pr-statistics-checkpoint-v1";
-    const CHECKPOINT_PAGE_PREFIX = `${CHECKPOINT_KEY_PREFIX}-page`;
-    const CHECKPOINT_MAX_AGE_MS = DAY_MS;
     const HAN_PATTERN = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/u;
     const MAINTAINER_ASSOCIATIONS = new Set([
         "OWNER",
@@ -851,151 +847,6 @@
         return changes.length ? `分析期间额度变化：${changes.join("，")}` : "";
     }
 
-    function checkpointStorageAvailable() {
-        return (
-            typeof GM_getValue === "function" &&
-            typeof GM_setValue === "function" &&
-            typeof GM_deleteValue === "function"
-        );
-    }
-
-    function checkpointStorageKey(repository, selectedScope, options) {
-        return `${CHECKPOINT_KEY_PREFIX}:${[
-            repository.owner.toLowerCase(),
-            repository.name.toLowerCase(),
-            selectedScope,
-            options.includeIssues ? "issues" : "no-issues",
-            options.includeDraftHistory ? "draft" : "no-draft",
-        ]
-            .map(encodeURIComponent)
-            .join(":")}`;
-    }
-
-    function clearStoredCheckpoint(metadata = null, storageKey = null) {
-        if (!checkpointStorageAvailable()) return;
-        let checkpoint = metadata;
-        const key = storageKey || metadata?.storageKey;
-        if (!key) return;
-        try {
-            checkpoint ||= GM_getValue(key, null);
-        } catch (_error) {
-            return;
-        }
-        for (const pageKey of checkpoint?.pageKeys || []) {
-            try {
-                GM_deleteValue(pageKey);
-            } catch (_error) {
-                // 清理失败不应阻止统计。
-            }
-        }
-        try {
-            GM_deleteValue(key);
-        } catch (_error) {
-            // 清理失败不应阻止统计。
-        }
-    }
-
-    function checkpointMatches(metadata, repository, selectedScope, options) {
-        return (
-            metadata?.version === 1 &&
-            metadata.storageKey ===
-                checkpointStorageKey(repository, selectedScope, options) &&
-            metadata.owner === repository.owner.toLowerCase() &&
-            metadata.name === repository.name.toLowerCase() &&
-            metadata.scope === selectedScope &&
-            metadata.includeIssues === options.includeIssues &&
-            metadata.includeDraftHistory === options.includeDraftHistory &&
-            Array.isArray(metadata.pageKeys) &&
-            typeof metadata.fetchPulls === "boolean" &&
-            typeof metadata.fetchIssues === "boolean" &&
-            Number.isInteger(metadata.page) &&
-            Number.isInteger(metadata.prPage) &&
-            Number.isInteger(metadata.issuePage) &&
-            Number.isInteger(metadata.pageSizeIndex) &&
-            Number.isFinite(Date.parse(metadata.savedAt)) &&
-            Date.now() - Date.parse(metadata.savedAt) <=
-                CHECKPOINT_MAX_AGE_MS
-        );
-    }
-
-    function restoreStoredCheckpoint(repository, selectedScope, options) {
-        if (!checkpointStorageAvailable()) return null;
-        const storageKey = checkpointStorageKey(
-            repository,
-            selectedScope,
-            options,
-        );
-        let metadata;
-        try {
-            metadata = GM_getValue(storageKey, null);
-        } catch (_error) {
-            return null;
-        }
-        if (!metadata) return null;
-        if (!checkpointMatches(metadata, repository, selectedScope, options)) {
-            clearStoredCheckpoint(metadata, storageKey);
-            return null;
-        }
-
-        const pullRequests = [];
-        const issues = [];
-        try {
-            for (const pageKey of metadata.pageKeys) {
-                const chunk = GM_getValue(pageKey, null);
-                if (
-                    !Array.isArray(chunk?.pullRequests) ||
-                    !Array.isArray(chunk?.issues)
-                ) {
-                    throw new Error("断点分页数据缺失");
-                }
-                pullRequests.push(...chunk.pullRequests);
-                issues.push(...chunk.issues);
-            }
-        } catch (_error) {
-            clearStoredCheckpoint(metadata, storageKey);
-            return null;
-        }
-        return { metadata, pullRequests, issues };
-    }
-
-    function createCheckpointMetadata(repository, selectedScope, options) {
-        const storageKey = checkpointStorageKey(
-            repository,
-            selectedScope,
-            options,
-        );
-        clearStoredCheckpoint(null, storageKey);
-        return {
-            version: 1,
-            storageKey,
-            owner: repository.owner.toLowerCase(),
-            name: repository.name.toLowerCase(),
-            scope: selectedScope,
-            includeIssues: options.includeIssues,
-            includeDraftHistory: options.includeDraftHistory,
-            sessionId: String(Date.now()),
-            pageKeys: [],
-            savedAt: new Date().toISOString(),
-        };
-    }
-
-    function persistCheckpointPage(metadata, state, pullRequests, issues) {
-        if (!checkpointStorageAvailable()) return null;
-        const pageKey = `${CHECKPOINT_PAGE_PREFIX}-${metadata.sessionId}-${state.page}`;
-        try {
-            GM_setValue(pageKey, { pullRequests, issues });
-            metadata.pageKeys.push(pageKey);
-            Object.assign(metadata, state, {
-                savedAt: new Date().toISOString(),
-            });
-            GM_setValue(metadata.storageKey, metadata);
-            return null;
-        } catch (error) {
-            clearStoredCheckpoint(metadata);
-            return error;
-        }
-    }
-
     function formatApiError(message, response) {
         const rateLimit = rateLimitFromHeaders(response.responseHeaders);
         const requestId = responseHeader(response, "x-github-request-id");
@@ -1467,41 +1318,9 @@
         const selectedOptions = { ...DEFAULT_OPTIONS, ...requestedOptions };
         const pageSizes =
             selectedScope === "open" ? OPEN_PAGE_SIZES : HISTORY_PAGE_SIZES;
-        if (!selectedOptions.resumeIncomplete) {
-            clearStoredCheckpoint(
-                null,
-                checkpointStorageKey(
-                    repository,
-                    selectedScope,
-                    selectedOptions,
-                ),
-            );
-        }
-        const checkpointEnabled =
-            selectedOptions.resumeIncomplete && checkpointStorageAvailable();
-        const restoredCheckpoint = checkpointEnabled
-            ? restoreStoredCheckpoint(
-                  repository,
-                  selectedScope,
-                  selectedOptions,
-              )
-            : null;
-        let checkpointMetadata =
-            restoredCheckpoint?.metadata ||
-            (checkpointEnabled
-                ? createCheckpointMetadata(
-                      repository,
-                      selectedScope,
-                      selectedOptions,
-                  )
-                : null);
-        const savedState = restoredCheckpoint?.metadata;
-        let pageSizeIndex = Math.min(
-            Math.max(savedState?.pageSizeIndex || 0, 0),
-            pageSizes.length - 1,
-        );
-        const pullRequests = restoredCheckpoint?.pullRequests || [];
-        const issues = restoredCheckpoint?.issues || [];
+        let pageSizeIndex = 0;
+        const pullRequests = [];
+        const issues = [];
         const rateLimits = {
             graphql: startingRateLimits?.graphql || null,
             rest: startingRateLimits?.rest || null,
@@ -1513,33 +1332,17 @@
             overflowRest: 0,
             inlineCommentRest: 0,
             commitStatsRest: 0,
-            ...(savedState?.usage || {}),
         };
-        let prCursor = savedState?.prCursor || null;
-        let issueCursor = savedState?.issueCursor || null;
-        let fetchPulls = savedState?.fetchPulls ?? true;
-        let fetchIssues =
-            savedState?.fetchIssues ?? selectedOptions.includeIssues;
-        let prTotal = savedState?.prTotal ?? null;
-        let issueTotal =
-            savedState?.issueTotal ??
-            (selectedOptions.includeIssues ? null : 0);
-        let page = savedState?.page || 0;
-        let prPage = savedState?.prPage || 0;
-        let issuePage = savedState?.issuePage || 0;
+        let prCursor = null;
+        let issueCursor = null;
+        let fetchPulls = true;
+        let fetchIssues = selectedOptions.includeIssues;
+        let prTotal = null;
+        let issueTotal = selectedOptions.includeIssues ? null : 0;
+        let page = 0;
+        let prPage = 0;
+        let issuePage = 0;
         const combineResources = selectedScope === "open";
-
-        if (restoredCheckpoint) {
-            onProgress(
-                `已恢复 ${formatDate(savedState.savedAt)} 的断点；PR ${pullRequests.length}/${prTotal ?? "?"}，Issue ${issues.length}/${issueTotal ?? "?"}；此前完成 ${page} 次 GraphQL 请求、累计 cost ${usage.graphqlPoints}`,
-                null,
-            );
-        } else if (checkpointEnabled) {
-            onProgress(
-                "断点续传已启用；每个成功的 GraphQL 页面会保存到油猴本地存储，24 小时内可接着分析（不保存 Token）",
-                null,
-            );
-        }
 
         while (fetchPulls || fetchIssues) {
             // 全量历史的嵌套评论响应可能很大。Open 通常很小，仍合并为
@@ -1561,8 +1364,6 @@
                 );
             }
             const requestLabel = requestParts.join(" + ");
-            const pullCountBefore = pullRequests.length;
-            const issueCountBefore = issues.length;
             let data;
             let pageSize;
             let requestSeconds;
@@ -1721,33 +1522,6 @@
                 );
                 pageSizeIndex += 1;
             }
-            if (checkpointMetadata) {
-                const checkpointError = persistCheckpointPage(
-                    checkpointMetadata,
-                    {
-                        prCursor,
-                        issueCursor,
-                        fetchPulls,
-                        fetchIssues,
-                        prTotal,
-                        issueTotal,
-                        page,
-                        prPage,
-                        issuePage,
-                        pageSizeIndex,
-                        usage: { ...usage },
-                    },
-                    pullRequests.slice(pullCountBefore),
-                    issues.slice(issueCountBefore),
-                );
-                if (checkpointError) {
-                    checkpointMetadata = null;
-                    onProgress(
-                        `断点保存失败，本次分析继续但无法续传：${checkpointError.message || String(checkpointError)}`,
-                        null,
-                    );
-                }
-            }
         }
 
         if (selectedOptions.completeInteractions) {
@@ -1781,12 +1555,6 @@
             commitResult.entries,
             selectedScope === "all",
         );
-
-        if (checkpointMetadata) {
-            clearStoredCheckpoint(checkpointMetadata);
-            checkpointMetadata = null;
-            onProgress("分析完成；已清除本次断点数据", null);
-        }
 
         // ponytail: exact inline comments are opt-in because Open scope costs at
         // least one REST request per PR; exact per-commit history is intentionally
@@ -2001,13 +1769,6 @@
                 "否",
                 "0 请求；完整度取决于范围与互动开关",
                 "低",
-            ],
-            [
-                "失败后接着上次进度",
-                "油猴本地按页断点（24 小时）",
-                "可选",
-                `0 API；当前${costOptions.resumeIncomplete ? "已启用" : "未启用"}`,
-                "低/占用本地存储",
             ],
             [
                 "Commit 时间与作者分布",
@@ -2541,7 +2302,7 @@
         const warning = warnings.length ? `；覆盖说明：${warnings.join("；")}` : "";
         const quotas = formatRateLimits();
         const rateLimit = quotas ? `；${quotas}` : "";
-        const usage = `；本次任务累计消耗 GraphQL ${lastUsage.graphqlPoints} points / ${lastUsage.graphqlRequests} 次请求，REST ${lastUsage.restRequests} 次请求`;
+        const usage = `；本次消耗 GraphQL ${lastUsage.graphqlPoints} points / ${lastUsage.graphqlRequests} 次请求，REST ${lastUsage.restRequests} 次请求`;
         setStatus(
             `已分析 ${analysis.rows.length} 个 PR、${analysis.issueRows.length} 个 Issue；当前显示 ${total} 个 PR${warning}${usage}${rateLimit}`,
             "success",
@@ -2568,7 +2329,6 @@
         ui.includeCommits.disabled = value;
         ui.includeDraftHistory.disabled = value;
         ui.completeInteractions.disabled = value;
-        ui.resumeIncomplete.disabled = value;
         ui.export.disabled = value || !analysis;
         ui.analyze.textContent = value ? "分析中…" : "重新分析";
     }
@@ -2579,7 +2339,6 @@
             includeCommits: ui.includeCommits.checked,
             includeDraftHistory: ui.includeDraftHistory.checked,
             completeInteractions: ui.completeInteractions.checked,
-            resumeIncomplete: ui.resumeIncomplete.checked,
         };
     }
 
@@ -2661,7 +2420,7 @@
                 ? " + 完整互动 REST"
                 : "（不扫描行内评论）"
         }`;
-        const modules = `模块：Issue ${requestedOptions.includeIssues ? "开" : "关"}，Commit ${requestedOptions.includeCommits ? "开" : "关"}，曾经 Draft ${requestedOptions.includeDraftHistory ? "开" : "关"}，完整互动 ${requestedOptions.completeInteractions ? "开" : "关"}，断点续传 ${requestedOptions.resumeIncomplete ? "开" : "关"}`;
+        const modules = `模块：Issue ${requestedOptions.includeIssues ? "开" : "关"}，Commit ${requestedOptions.includeCommits ? "开" : "关"}，曾经 Draft ${requestedOptions.includeDraftHistory ? "开" : "关"}，完整互动 ${requestedOptions.completeInteractions ? "开" : "关"}`;
         lastRateLimits = { graphql: null, rest: null };
         lastUsage = {
             graphqlPoints: 0,
@@ -2748,36 +2507,8 @@
             } catch (quotaError) {
                 quotaDetails = `；失败后额度查询也失败：${quotaError.message || String(quotaError)}`;
             }
-            let checkpointDetails = "";
-            if (
-                requestedOptions.resumeIncomplete &&
-                checkpointStorageAvailable()
-            ) {
-                try {
-                    const checkpoint = GM_getValue(
-                        checkpointStorageKey(
-                            currentRepository,
-                            requestedScope,
-                            requestedOptions,
-                        ),
-                        null,
-                    );
-                    if (
-                        checkpointMatches(
-                            checkpoint,
-                            currentRepository,
-                            requestedScope,
-                            requestedOptions,
-                        )
-                    ) {
-                        checkpointDetails = `；断点已保留：PR ${checkpoint.prPage} 页、Issue ${checkpoint.issuePage} 页；保持当前仓库、范围及 Issue/Draft 选项后再次分析即可继续`;
-                    }
-                } catch (_checkpointError) {
-                    // 读取断点失败时保留原始错误信息。
-                }
-            }
             setStatus(
-                `${error.message || String(error)}${quotaDetails}${checkpointDetails}`,
+                `${error.message || String(error)}${quotaDetails}`,
                 "error",
             );
         } finally {
@@ -2821,8 +2552,7 @@
         ui.token.value = "";
         ui.settings.open = false;
         updateTokenState();
-        setStatus("Token 已保存，正在分析…", "success");
-        runAnalysis();
+        setStatus("Token 已保存；请选择分析选项，然后点击“开始分析”", "success");
     }
 
     function clearToken() {
@@ -2997,9 +2727,8 @@
                 <label><input id="include-commits" type="checkbox" checked>Commit 概览（1 REST）</label>
                 <label title="读取 Draft/Ready 时间线，约增加 1 GraphQL point/100 PR"><input id="include-draft-history" type="checkbox">曾经 Draft</label>
                 <label title="Open 模式至少每个 PR 一次 REST；全部历史按每 100 条行内评论一次 REST"><input id="complete-interactions" type="checkbox">完整互动（高成本）</label>
-                <label title="按页保存到油猴本地存储；失败后从下一页继续，成功后自动删除，最长保留 24 小时"><input id="resume-incomplete" type="checkbox" checked>接着上次未完成进度</label>
               </div>
-              <p id="status">尚未分析</p>
+              <p id="status">请选择范围和选项，然后点击“开始分析”</p>
               <section class="section">
                 <h3>Pull Request</h3>
                 <div id="cards" class="cards"></div>
@@ -3048,7 +2777,6 @@
                 中文判定：标题或原始正文任一处含中文。主 GraphQL 查询只请求评论/Review 的作者、身份关系、发布时间和修改时间，不请求正文；“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
                 stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
                 核心贡献者默认指内部成员，或达到 5 个合并 PR、10 次 Review、20 个 Commit 任一阈值。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
-                断点续传会把已获取的 PR/Issue 字段按页保存在油猴本地存储中，不保存 Token；断点最长保留 24 小时，完整成功后自动删除。取消该选项会清除旧断点并从头分析。
               </p>
             </main>
           </section>
@@ -3071,7 +2799,6 @@
             includeCommits: get("#include-commits"),
             includeDraftHistory: get("#include-draft-history"),
             completeInteractions: get("#complete-interactions"),
-            resumeIncomplete: get("#resume-incomplete"),
             status: get("#status"),
             log: get("#log"),
             cards: get("#cards"),
@@ -3110,7 +2837,6 @@
                 "aria-expanded",
                 String(!ui.panel.hidden),
             );
-            if (!ui.panel.hidden && !analysis) runAnalysis();
         });
         ui.close.addEventListener("click", () => {
             ui.panel.hidden = true;
@@ -3128,7 +2854,6 @@
             ui.includeCommits,
             ui.includeDraftHistory,
             ui.completeInteractions,
-            ui.resumeIncomplete,
         ]) {
             input.addEventListener("change", saveOptions);
         }
@@ -3150,7 +2875,11 @@
         ) {
             render();
         } else if (!ui.panel.hidden) {
-            runAnalysis();
+            resetOutput();
+            renderCostGuide();
+            setStatus(
+                `已选择“${value === "all" ? "全部历史" : "仅 Open"}”；确认选项后点击“${analysis ? "重新分析" : "开始分析"}”`,
+            );
         }
     }
 
@@ -3186,7 +2915,7 @@
             ui.log.textContent = "";
             resetOutput();
             renderCostGuide();
-            setStatus("尚未分析");
+            setStatus("请选择范围和选项，然后点击“开始分析”");
         }
     }
 
