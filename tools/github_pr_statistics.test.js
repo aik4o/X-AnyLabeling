@@ -382,6 +382,140 @@ async function testGraphqlErrorDetails() {
     assert.match(logs[0], /对象上限 100\/页.*互动连接上限 10 条元数据/);
 }
 
+async function testGraphqlResumeFromCheckpoint() {
+    const resetAt = "2026-03-10T01:00:00Z";
+    const startingRateLimits = {
+        rest: null,
+        graphql: {
+            limit: 5000,
+            used: 0,
+            remaining: 5000,
+            resetAt,
+            resource: "graphql",
+        },
+    };
+    const options = {
+        includeIssues: false,
+        includeCommits: false,
+        completeInteractions: false,
+    };
+    let checkpoint = null;
+    let request = 0;
+    global.GM_xmlhttpRequest = ({ data, onload }) => {
+        request += 1;
+        const variables = JSON.parse(data).variables;
+        if (request === 1) {
+            assert.equal(variables.prCursor, null);
+            onload({
+                status: 200,
+                responseHeaders: "",
+                responseText: JSON.stringify({
+                    data: {
+                        repository: {
+                            pullRequests: {
+                                totalCount: 2,
+                                nodes: [{ number: 1 }],
+                                pageInfo: {
+                                    hasNextPage: true,
+                                    endCursor: "cursor-1",
+                                },
+                            },
+                        },
+                        rateLimit: {
+                            cost: 1,
+                            limit: 5000,
+                            remaining: 4999,
+                            resetAt,
+                            used: 1,
+                        },
+                    },
+                }),
+            });
+            return;
+        }
+        assert.equal(variables.prCursor, "cursor-1");
+        onload({
+            status: 200,
+            responseHeaders: "",
+            responseText: JSON.stringify({
+                errors: [{ message: "permanent test interruption" }],
+            }),
+        });
+    };
+
+    await assert.rejects(
+        stats.fetchRepositoryData(
+            { owner: "o", name: "r" },
+            "token",
+            "all",
+            () => {},
+            options,
+            startingRateLimits,
+            null,
+            (state) => {
+                checkpoint = state;
+            },
+        ),
+        /permanent test interruption/,
+    );
+    assert.equal(checkpoint.pullRequests.length, 1);
+    assert.equal(checkpoint.prCursor, "cursor-1");
+    assert.equal(checkpoint.prPage, 1);
+
+    const resumeLogs = [];
+    global.GM_xmlhttpRequest = ({ data, onload }) => {
+        const variables = JSON.parse(data).variables;
+        assert.equal(variables.prCursor, "cursor-1");
+        assert.equal(variables.pageSize, 100);
+        onload({
+            status: 200,
+            responseHeaders: "",
+            responseText: JSON.stringify({
+                data: {
+                    repository: {
+                        pullRequests: {
+                            totalCount: 2,
+                            nodes: [{ number: 2 }],
+                            pageInfo: {
+                                hasNextPage: false,
+                                endCursor: null,
+                            },
+                        },
+                    },
+                    rateLimit: {
+                        cost: 1,
+                        limit: 5000,
+                        remaining: 4998,
+                        resetAt,
+                        used: 2,
+                    },
+                },
+            }),
+        });
+    };
+
+    const result = await stats.fetchRepositoryData(
+        { owner: "o", name: "r" },
+        "token",
+        "all",
+        (message) => resumeLogs.push(message),
+        options,
+        startingRateLimits,
+        checkpoint,
+        (state) => {
+            checkpoint = state;
+        },
+    );
+    assert.deepEqual(
+        result.raw.pullRequests.map((pr) => pr.number),
+        [1, 2],
+    );
+    assert.equal(result.usage.graphqlRequests, 2);
+    assert.equal(result.usage.graphqlPoints, 2);
+    assert.match(resumeLogs[0], /恢复读取检查点.*已有 PR 1\/2/);
+    assert.match(resumeLogs.join("\n"), /GraphQL 第 2 次请求完成/);
+}
+
 async function testSafeGraphqlPageFallback() {
     const logs = [];
     const pageSizes = [];
@@ -645,6 +779,7 @@ async function testRateLimitLookup() {
 testSeparatedLocalAnalysis()
     .then(testAllHistorySplitsPullsAndIssues)
     .then(testGraphqlErrorDetails)
+    .then(testGraphqlResumeFromCheckpoint)
     .then(testSafeGraphqlPageFallback)
     .then(testPageSizeDropsAndRecoversByTen)
     .then(testRateLimitLookup)

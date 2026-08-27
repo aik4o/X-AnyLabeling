@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.4
+// @version      0.6.5
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -20,6 +20,9 @@
 
     const TOKEN_KEY = "github-pr-statistics-token";
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
+    const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
+    const CHECKPOINT_VERSION = 1;
+    const SCRIPT_VERSION = "0.6.5";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -140,6 +143,7 @@
     let analyzedScope = null;
     let analyzedOptions = null;
     let loading = false;
+    let fetchCheckpoint = null;
     let lastRateLimits = { graphql: null, rest: null };
     let lastUsage = {
         graphqlPoints: 0,
@@ -150,6 +154,30 @@
         commitStatsRest: 0,
     };
     let overflowItems = [];
+
+    function fetchCheckpointKey(repository, selectedScope, options) {
+        return JSON.stringify([
+            repository.owner,
+            repository.name,
+            selectedScope,
+            Boolean(options.includeIssues),
+            Boolean(options.includeCommits),
+            Boolean(options.completeInteractions),
+        ]);
+    }
+
+    function compatibleFetchCheckpoint(repository, selectedScope, options) {
+        return fetchCheckpoint?.version === CHECKPOINT_VERSION &&
+            fetchCheckpoint.key ===
+                fetchCheckpointKey(repository, selectedScope, options)
+            ? fetchCheckpoint
+            : null;
+    }
+
+    function clearFetchCheckpoint() {
+        fetchCheckpoint = null;
+        GM_deleteValue(CHECKPOINT_KEY);
+    }
 
     function classifyLanguage(title, body) {
         return HAN_PATTERN.test(`${title || ""}\n${body || ""}`)
@@ -1296,14 +1324,35 @@
         onProgress,
         requestedOptions = DEFAULT_OPTIONS,
         startingRateLimits = null,
+        resumeState = null,
+        onCheckpoint = () => {},
     ) {
         const selectedOptions = { ...DEFAULT_OPTIONS, ...requestedOptions };
-        let pageSize = MAX_PAGE_SIZE;
-        const pullRequests = [];
-        const issues = [];
+        const checkpointKey = fetchCheckpointKey(
+            repository,
+            selectedScope,
+            selectedOptions,
+        );
+        const resume =
+            resumeState?.version === CHECKPOINT_VERSION &&
+            resumeState.key === checkpointKey
+                ? resumeState
+                : null;
+        let pageSize = Math.max(
+            MIN_PAGE_SIZE,
+            Math.min(MAX_PAGE_SIZE, Number(resume?.pageSize) || MAX_PAGE_SIZE),
+        );
+        const pullRequests = Array.isArray(resume?.pullRequests)
+            ? resume.pullRequests
+            : [];
+        const issues = Array.isArray(resume?.issues) ? resume.issues : [];
         const rateLimits = {
-            graphql: startingRateLimits?.graphql || null,
-            rest: startingRateLimits?.rest || null,
+            graphql:
+                startingRateLimits?.graphql ||
+                resume?.rateLimits?.graphql ||
+                null,
+            rest:
+                startingRateLimits?.rest || resume?.rateLimits?.rest || null,
         };
         const usage = {
             graphqlPoints: 0,
@@ -1312,17 +1361,60 @@
             overflowRest: 0,
             inlineCommentRest: 0,
             commitStatsRest: 0,
+            ...(resume?.usage || {}),
         };
-        let prCursor = null;
-        let issueCursor = null;
-        let fetchPulls = true;
-        let fetchIssues = selectedOptions.includeIssues;
-        let prTotal = null;
-        let issueTotal = selectedOptions.includeIssues ? null : 0;
-        let page = 0;
-        let prPage = 0;
-        let issuePage = 0;
+        let prCursor = resume?.prCursor || null;
+        let issueCursor = resume?.issueCursor || null;
+        let fetchPulls = resume ? Boolean(resume.fetchPulls) : true;
+        let fetchIssues = resume
+            ? Boolean(resume.fetchIssues)
+            : selectedOptions.includeIssues;
+        let prTotal = resume?.prTotal ?? null;
+        let issueTotal = resume
+            ? (resume.issueTotal ?? null)
+            : selectedOptions.includeIssues
+              ? null
+              : 0;
+        let page = Number(resume?.page) || 0;
+        let prPage = Number(resume?.prPage) || 0;
+        let issuePage = Number(resume?.issuePage) || 0;
         const combineResources = selectedScope === "open";
+        const saveCheckpoint = (cloneGraphqlData = false) => {
+            const state = {
+                version: CHECKPOINT_VERSION,
+                key: checkpointKey,
+                repository: { ...repository },
+                selectedScope,
+                selectedOptions: { ...selectedOptions },
+                pageSize,
+                pullRequests,
+                issues,
+                rateLimits: { ...rateLimits },
+                usage: { ...usage },
+                prCursor,
+                issueCursor,
+                fetchPulls,
+                fetchIssues,
+                prTotal,
+                issueTotal,
+                page,
+                prPage,
+                issuePage,
+            };
+            if (cloneGraphqlData) {
+                state.pullRequests = JSON.parse(JSON.stringify(pullRequests));
+                state.issues = JSON.parse(JSON.stringify(issues));
+            }
+            onCheckpoint(state);
+        };
+
+        saveCheckpoint();
+        if (resume) {
+            onProgress(
+                `恢复读取检查点；已有 PR ${pullRequests.length}/${prTotal ?? "?"}、Issue ${issues.length}/${issueTotal ?? "?"}；从未完成页继续`,
+                rateLimits.graphql,
+            );
+        }
 
         while (fetchPulls || fetchIssues) {
             // 全量历史的嵌套评论响应可能很大。Open 通常很小，仍合并为
@@ -1376,6 +1468,7 @@
                     ).toFixed(1);
                     break;
                 } catch (error) {
+                    saveCheckpoint();
                     const seconds = (
                         (Date.now() - requestStartedAt) /
                         1000
@@ -1454,9 +1547,11 @@
                         afterFailure,
                     );
                     pageSize = nextPageSize;
+                    saveCheckpoint();
                 }
             }
             if (!data?.repository) {
+                saveCheckpoint();
                 throw new Error("仓库不存在，或 Token 没有读取权限");
             }
             if (requestPulls) {
@@ -1526,9 +1621,13 @@
                 );
                 pageSize = nextPageSize;
             }
+            saveCheckpoint();
         }
 
         if (selectedOptions.completeInteractions) {
+            // 保留一份未被 REST 补全过程修改的 GraphQL 检查点；如果 REST
+            // 中断，继续时从干净数据重新补全，避免重复追加行内评论。
+            saveCheckpoint(true);
             onProgress(
                 "GraphQL 基础数据读取完成；开始读取完整互动数据",
                 null,
@@ -2402,7 +2501,21 @@
         ui.includeCommits.disabled = value;
         ui.completeInteractions.disabled = value;
         ui.export.disabled = value || !analysis;
-        ui.analyze.textContent = value ? "分析中…" : "重新分析";
+        const canResume =
+            !value &&
+            currentRepository &&
+            compatibleFetchCheckpoint(
+                currentRepository,
+                scope,
+                selectedOptions(),
+            );
+        ui.analyze.textContent = value
+            ? "分析中…"
+            : canResume
+              ? "继续分析"
+              : analysis
+                ? "重新分析"
+                : "开始分析";
     }
 
     function selectedOptions() {
@@ -2414,7 +2527,9 @@
     }
 
     function saveOptions() {
+        clearFetchCheckpoint();
         GM_setValue(OPTIONS_KEY, selectedOptions());
+        ui.analyze.textContent = analysis ? "重新分析" : "开始分析";
         if (analysis) {
             setStatus("分析选项已改变；点击“重新分析”后生效");
         }
@@ -2483,6 +2598,19 @@
 
         const requestedScope = scope;
         const requestedOptions = selectedOptions();
+        if (!fetchCheckpoint) {
+            const storedCheckpoint = GM_getValue(CHECKPOINT_KEY, null);
+            fetchCheckpoint =
+                storedCheckpoint?.version === CHECKPOINT_VERSION
+                    ? storedCheckpoint
+                    : null;
+        }
+        const resumeCheckpoint = compatibleFetchCheckpoint(
+            currentRepository,
+            requestedScope,
+            requestedOptions,
+        );
+        if (!resumeCheckpoint) clearFetchCheckpoint();
         const graphQlStrategy =
             requestedScope === "open"
                 ? `合并 PR/Issue GraphQL 自适应分页（初始 ${MAX_PAGE_SIZE}/页，失败 -${PAGE_SIZE_STEP}，成功 +${PAGE_SIZE_STEP}）`
@@ -2501,6 +2629,7 @@
             overflowRest: 0,
             inlineCommentRest: 0,
             commitStatsRest: 0,
+            ...(resumeCheckpoint?.usage || {}),
         };
         analysis = null;
         analyzedScope = null;
@@ -2510,9 +2639,9 @@
         resetOutput();
         setProgress(null, "读取数据：准备请求 GitHub API");
         setStatus(
-            `开始读取 ${currentRepository.owner}/${currentRepository.name} 的原始数据；范围：${
+            `脚本 v${SCRIPT_VERSION}；${resumeCheckpoint ? "继续读取" : "开始读取"} ${currentRepository.owner}/${currentRepository.name} 的原始数据；范围：${
                 requestedScope === "open" ? "仅 Open" : "全部历史"
-            }；低额度策略：${strategy}；${modules}`,
+            }；${resumeCheckpoint ? `已保留 PR ${resumeCheckpoint.pullRequests?.length || 0}/${resumeCheckpoint.prTotal ?? "?"}、Issue ${resumeCheckpoint.issues?.length || 0}/${resumeCheckpoint.issueTotal ?? "?"}；` : ""}低额度策略：${strategy}；${modules}`,
         );
         let baselineRateLimits = null;
         try {
@@ -2547,6 +2676,10 @@
                 },
                 requestedOptions,
                 baselineRateLimits,
+                resumeCheckpoint,
+                (checkpoint) => {
+                    fetchCheckpoint = checkpoint;
+                },
             );
             lastUsage = fetchedData.usage;
             setProgress(null, "读取数据：复核 GitHub 实时额度");
@@ -2590,14 +2723,24 @@
             analysis.rateLimits = lastRateLimits;
             render();
             setProgress(100, "分析与图表生成完成");
+            clearFetchCheckpoint();
         } catch (error) {
             const currentProgress = ui.progress.hasAttribute("value")
                 ? ui.progress.value
                 : 0;
             if (phase === "analysis") {
+                let checkpointDetails = "";
+                if (fetchCheckpoint) {
+                    try {
+                        GM_setValue(CHECKPOINT_KEY, fetchCheckpoint);
+                        checkpointDetails = "；读取检查点已保存，点击“继续分析”可重试本地分析";
+                    } catch (checkpointError) {
+                        checkpointDetails = `；检查点持久化失败，但当前页面仍可继续：${checkpointError.message || String(checkpointError)}`;
+                    }
+                }
                 setProgress(currentProgress, "本地分析失败");
                 setStatus(
-                    `本地分析失败；原始数据已经读取完成，本阶段没有调用 GitHub API；${error.message || String(error)}`,
+                    `本地分析失败；原始数据已经读取完成，本阶段没有调用 GitHub API；${error.message || String(error)}${checkpointDetails}`,
                     "error",
                 );
                 return;
@@ -2614,8 +2757,17 @@
             } catch (quotaError) {
                 quotaDetails = `；失败后额度查询也失败：${quotaError.message || String(quotaError)}`;
             }
+            let checkpointDetails = "";
+            if (fetchCheckpoint) {
+                try {
+                    GM_setValue(CHECKPOINT_KEY, fetchCheckpoint);
+                    checkpointDetails = `；读取检查点已保存：PR ${fetchCheckpoint.pullRequests?.length || 0}/${fetchCheckpoint.prTotal ?? "?"}、Issue ${fetchCheckpoint.issues?.length || 0}/${fetchCheckpoint.issueTotal ?? "?"}；点击“继续分析”将从未完成页继续`;
+                } catch (checkpointError) {
+                    checkpointDetails = `；检查点持久化失败，但当前页面仍可继续：${checkpointError.message || String(checkpointError)}`;
+                }
+            }
             setStatus(
-                `${error.message || String(error)}${quotaDetails}`,
+                `${error.message || String(error)}${quotaDetails}${checkpointDetails}`,
                 "error",
             );
         } finally {
@@ -2655,6 +2807,7 @@
             setStatus("Token 不能为空；如需删除请点击“清除 Token”", "error");
             return;
         }
+        clearFetchCheckpoint();
         GM_setValue(TOKEN_KEY, token);
         ui.token.value = "";
         ui.settings.open = false;
@@ -2663,6 +2816,7 @@
     }
 
     function clearToken() {
+        clearFetchCheckpoint();
         GM_deleteValue(TOKEN_KEY);
         ui.token.value = "";
         updateTokenState();
@@ -2982,6 +3136,7 @@
 
     function setScope(value) {
         if (loading || value === scope) return;
+        clearFetchCheckpoint();
         scope = value;
         ui.scopeAll.classList.toggle("active", value === "all");
         ui.scopeOpen.classList.toggle("active", value === "open");
@@ -3013,8 +3168,35 @@
             repository.owner !== currentRepository.owner ||
             repository.name !== currentRepository.name;
         currentRepository = repository;
-        ui.title.textContent = `${repository.owner}/${repository.name} 仓库统计`;
+        ui.title.textContent = `${repository.owner}/${repository.name} 仓库统计 v${SCRIPT_VERSION}`;
         if (changed) {
+            if (!fetchCheckpoint) {
+                const storedCheckpoint = GM_getValue(CHECKPOINT_KEY, null);
+                fetchCheckpoint =
+                    storedCheckpoint?.version === CHECKPOINT_VERSION
+                        ? storedCheckpoint
+                        : null;
+            }
+            if (
+                fetchCheckpoint?.repository?.owner === repository.owner &&
+                fetchCheckpoint?.repository?.name === repository.name
+            ) {
+                scope = fetchCheckpoint.selectedScope;
+                ui.scopeAll.classList.toggle("active", scope === "all");
+                ui.scopeOpen.classList.toggle("active", scope === "open");
+                for (const [key, fallback] of Object.entries(DEFAULT_OPTIONS)) {
+                    ui[key].checked =
+                        typeof fetchCheckpoint.selectedOptions?.[key] ===
+                        "boolean"
+                            ? fetchCheckpoint.selectedOptions[key]
+                            : fallback;
+                }
+            }
+            const resumeCheckpoint = compatibleFetchCheckpoint(
+                repository,
+                scope,
+                selectedOptions(),
+            );
             analysis = null;
             analyzedScope = null;
             analyzedOptions = null;
@@ -3027,11 +3209,19 @@
                 overflowRest: 0,
                 inlineCommentRest: 0,
                 commitStatsRest: 0,
+                ...(resumeCheckpoint?.usage || {}),
             };
             ui.log.textContent = "";
             resetOutput();
             renderCostGuide();
-            setStatus("请选择范围和选项，然后点击“开始分析”");
+            ui.analyze.textContent = resumeCheckpoint
+                ? "继续分析"
+                : "开始分析";
+            setStatus(
+                resumeCheckpoint
+                    ? `检测到未完成读取：PR ${resumeCheckpoint.pullRequests?.length || 0}/${resumeCheckpoint.prTotal ?? "?"}、Issue ${resumeCheckpoint.issues?.length || 0}/${resumeCheckpoint.issueTotal ?? "?"}；点击“继续分析”从未完成页继续`
+                    : "请选择范围和选项，然后点击“开始分析”",
+            );
         }
     }
 
