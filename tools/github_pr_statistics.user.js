@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.3.0
+// @version      0.3.1
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -855,7 +855,11 @@
                     try {
                         payload = JSON.parse(response.responseText);
                     } catch (_error) {
-                        reject(new Error("GitHub 返回了无法解析的数据"));
+                        reject(
+                            new Error(
+                                `GitHub GraphQL 返回了非 JSON 响应 (${response.status || "未知状态"})；通常是查询过大或 GitHub 网关暂时失败`,
+                            ),
+                        );
                         return;
                     }
                     if (response.status !== 200) {
@@ -1227,8 +1231,15 @@
         let prTotal = null;
         let issueTotal = selectedOptions.includeIssues ? null : 0;
         let page = 0;
+        const combineResources = selectedScope === "open";
 
         while (fetchPulls || fetchIssues) {
+            // 全量历史的嵌套评论响应可能很大。Open 通常很小，仍合并为
+            // 一次请求；全量模式按 PR、Issue 分开分页，避免 GitHub 网关
+            // 返回非 JSON，同时保持每页 100 条。
+            const requestPulls = fetchPulls;
+            const requestIssues =
+                fetchIssues && (combineResources || !fetchPulls);
             const data = await requestGraphQL(REPOSITORY_QUERY, token, {
                 owner: repository.owner,
                 name: repository.name,
@@ -1240,14 +1251,14 @@
                         : ["OPEN", "CLOSED", "MERGED"],
                 issueStates:
                     selectedScope === "open" ? ["OPEN"] : ["OPEN", "CLOSED"],
-                fetchPulls,
-                fetchIssues,
+                fetchPulls: requestPulls,
+                fetchIssues: requestIssues,
                 includeDraftHistory: selectedOptions.includeDraftHistory,
             });
             if (!data.repository) {
                 throw new Error("仓库不存在，或 Token 没有读取权限");
             }
-            if (fetchPulls) {
+            if (requestPulls) {
                 const connection = data.repository.pullRequests;
                 prTotal ??= connection.totalCount;
                 for (const node of connection.nodes) {
@@ -1258,7 +1269,7 @@
                 prCursor = connection.pageInfo.endCursor;
                 fetchPulls = connection.pageInfo.hasNextPage;
             }
-            if (fetchIssues) {
+            if (requestIssues) {
                 const connection = data.repository.issues;
                 issueTotal ??= connection.totalCount;
                 issues.push(...connection.nodes);
@@ -1270,12 +1281,17 @@
             usage.graphqlPoints += rateLimit.cost;
             usage.graphqlRequests += 1;
             rateLimits.graphql = rateLimit;
+            const progress = [];
+            if (requestPulls) {
+                progress.push(
+                    `PR ${pullRequests.length}/${prTotal ?? "?"}`,
+                );
+            }
+            if (requestIssues) {
+                progress.push(`Issue ${issues.length}/${issueTotal ?? "?"}`);
+            }
             onProgress(
-                `GraphQL 主查询第 ${page} 页完成；PR ${pullRequests.length}/${prTotal ?? "?"}` +
-                    (selectedOptions.includeIssues
-                        ? `，Issue ${issues.length}/${issueTotal ?? "?"}`
-                        : "") +
-                    `；cost ${rateLimit.cost}`,
+                `GraphQL 第 ${page} 次请求完成；${progress.join("，")}；cost ${rateLimit.cost}`,
                 rateLimit,
             );
         }
@@ -1868,7 +1884,11 @@
 
         const requestedScope = scope;
         const requestedOptions = selectedOptions();
-        const strategy = `合并 PR/Issue GraphQL 分页 + 单次 Commit 统计${
+        const graphQlStrategy =
+            requestedScope === "open"
+                ? "合并 PR/Issue GraphQL 分页"
+                : "PR/Issue 分离 GraphQL 分页（每页 100）";
+        const strategy = `${graphQlStrategy} + 单次 Commit 统计${
             requestedOptions.completeInteractions
                 ? " + 完整互动 REST"
                 : "（不扫描行内评论）"

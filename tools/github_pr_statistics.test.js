@@ -135,4 +135,86 @@ assert.equal(
     true,
 );
 
-console.log("github_pr_statistics tests passed");
+async function testAllHistorySplitsPullsAndIssues() {
+    const requests = [];
+    global.GM_xmlhttpRequest = ({ data, onload }) => {
+        const variables = JSON.parse(data).variables;
+        requests.push({
+            fetchPulls: variables.fetchPulls,
+            fetchIssues: variables.fetchIssues,
+        });
+        const repository = {};
+        if (variables.fetchPulls) {
+            repository.pullRequests = {
+                totalCount: 0,
+                nodes: [],
+                pageInfo: { hasNextPage: false, endCursor: null },
+            };
+        }
+        if (variables.fetchIssues) {
+            repository.issues = {
+                totalCount: 0,
+                nodes: [],
+                pageInfo: { hasNextPage: false, endCursor: null },
+            };
+        }
+        onload({
+            status: 200,
+            responseHeaders: "",
+            responseText: JSON.stringify({
+                data: {
+                    repository,
+                    rateLimit: {
+                        cost: 1,
+                        limit: 5000,
+                        remaining: 4999,
+                        resetAt: "2026-03-10T01:00:00Z",
+                        used: 1,
+                    },
+                },
+            }),
+        });
+    };
+
+    await stats.fetchPullRequests(
+        { owner: "o", name: "r" },
+        "token",
+        "all",
+        () => {},
+        {
+            includeIssues: true,
+            includeCommits: false,
+            includeDraftHistory: false,
+            completeInteractions: false,
+        },
+    );
+
+    assert.deepEqual(requests, [
+        { fetchPulls: true, fetchIssues: false },
+        { fetchPulls: false, fetchIssues: true },
+    ]);
+
+    requests.length = 0;
+    await stats.fetchPullRequests(
+        { owner: "o", name: "r" },
+        "token",
+        "open",
+        () => {},
+        {
+            includeIssues: true,
+            includeCommits: false,
+            includeDraftHistory: false,
+            completeInteractions: false,
+        },
+    );
+    assert.deepEqual(requests, [
+        { fetchPulls: true, fetchIssues: true },
+    ]);
+}
+
+testAllHistorySplitsPullsAndIssues()
+    .then(() => console.log("github_pr_statistics tests passed"))
+    .catch((error) => {
+        console.error(error);
+        process.exitCode = 1;
+    });
