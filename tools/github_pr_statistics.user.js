@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.3.3
+// @version      0.3.4
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -27,7 +27,7 @@
         completeInteractions: false,
     });
     const RESOURCE_PAGE_SIZE = 100;
-    const INTERACTION_PREVIEW_SIZE = 20;
+    const INTERACTION_PREVIEW_SIZE = 10;
     const DAY_MS = 24 * 60 * 60 * 1000;
     const HAN_PATTERN = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/u;
     const MAINTAINER_ASSOCIATIONS = new Set([
@@ -78,7 +78,6 @@
                   totalCount
                   pageInfo { hasNextPage }
                   nodes {
-                    id url
                     author { login }
                     authorAssociation
                     createdAt updatedAt
@@ -88,7 +87,6 @@
                   totalCount
                   pageInfo { hasNextPage }
                   nodes {
-                    id url state
                     author { login }
                     authorAssociation
                     createdAt submittedAt updatedAt
@@ -135,7 +133,6 @@
                   totalCount
                   pageInfo { hasNextPage }
                   nodes {
-                    id url
                     author { login }
                     authorAssociation
                     createdAt updatedAt
@@ -1089,8 +1086,6 @@
 
     function normalizeRestComment(comment) {
         return {
-            id: String(comment.node_id || comment.id || ""),
-            url: comment.html_url || "",
             author: { login: comment.user?.login || "" },
             authorAssociation: comment.author_association,
             createdAt: comment.created_at,
@@ -1100,9 +1095,6 @@
 
     function normalizeRestReview(review) {
         return {
-            id: String(review.node_id || review.id || ""),
-            url: review.html_url || "",
-            state: review.state,
             author: { login: review.user?.login || "" },
             authorAssociation: review.author_association,
             createdAt: review.submitted_at,
@@ -1339,7 +1331,7 @@
         while (fetchPulls || fetchIssues) {
             // 全量历史的嵌套评论响应可能很大。Open 通常很小，仍合并为
             // 一次请求；全量模式按 PR、Issue 分开分页，避免 GitHub 网关
-            // 返回非 JSON。嵌套互动只预取常见的前 20 条，溢出数据可用
+            // 返回非 JSON。嵌套互动只预取较小的元数据窗口，溢出数据可用
             // “完整互动”选项补全。
             const requestPulls = fetchPulls;
             const requestIssues =
@@ -1357,7 +1349,7 @@
             }
             const requestLabel = requestParts.join(" + ");
             onProgress(
-                `准备请求 GraphQL ${requestLabel}；对象上限 ${RESOURCE_PAGE_SIZE}/页；每个互动连接上限 ${INTERACTION_PREVIEW_SIZE} 条；Draft 时间线${selectedOptions.includeDraftHistory ? "开启" : "关闭"}`,
+                `准备请求 GraphQL ${requestLabel}；对象上限 ${RESOURCE_PAGE_SIZE}/页；每个互动连接上限 ${INTERACTION_PREVIEW_SIZE} 条元数据（不含正文）；Draft 时间线${selectedOptions.includeDraftHistory ? "开启" : "关闭"}`,
                 null,
             );
             const requestStartedAt = Date.now();
@@ -1597,7 +1589,7 @@
                 "低",
             ],
             [
-                `PR 前 ${INTERACTION_PREVIEW_SIZE} 条普通评论/Reviews、修改时间、PR commit 数`,
+                `PR 前 ${INTERACTION_PREVIEW_SIZE} 条普通评论/Review 元数据（不含正文）、修改时间、PR commit 数`,
                 "主 GraphQL 嵌套连接",
                 "否",
                 "实际 cost 见日志；与主查询合并",
@@ -1625,7 +1617,7 @@
                 "可变",
             ],
             [
-                `Issue 基础字段、标签、关闭 PR、前 ${INTERACTION_PREVIEW_SIZE} 条评论`,
+                `Issue 基础字段、标签、关闭 PR、前 ${INTERACTION_PREVIEW_SIZE} 条评论元数据（不含正文）`,
                 "与 PR 主 GraphQL 合并",
                 "模块可选",
                 `实际 cost 见日志；本次 ${issueCount} 个`,
@@ -2397,7 +2389,7 @@
                 </p>
               </details>
               <p class="help">
-                中文判定：标题或原始正文任一处含中文。默认回复统计包含普通评论和 Review；行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
+                中文判定：标题或原始正文任一处含中文。主 GraphQL 查询只请求评论/Review 的作者、身份关系、发布时间和修改时间，不请求正文；“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
                 stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
                 核心贡献者默认指内部成员，或达到 5 个合并 PR、10 次 Review、20 个 Commit 任一阈值。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
               </p>

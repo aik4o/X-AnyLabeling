@@ -201,8 +201,9 @@ async function testAllHistorySplitsPullsAndIssues() {
             { fetchPulls: false, fetchIssues: true },
         ],
     );
-    assert.match(requests[0].query, /comments\(first: 20\)/);
+    assert.match(requests[0].query, /comments\(first: 10\)/);
     assert.match(requests[0].query, /pullRequests\(\s+first: 100/);
+    assert.doesNotMatch(requests[0].query, /id url/);
 
     requests.length = 0;
     await stats.fetchPullRequests(
@@ -261,7 +262,7 @@ async function testGraphqlErrorDetails() {
             return true;
         },
     );
-    assert.match(logs[0], /对象上限 100\/页.*互动连接上限 20 条/);
+    assert.match(logs[0], /对象上限 100\/页.*互动连接上限 10 条元数据/);
 }
 
 async function testRateLimitLookup() {
