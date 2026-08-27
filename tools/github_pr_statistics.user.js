@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.5.1
+// @version      0.6.0
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -29,6 +29,7 @@
     const OPEN_PAGE_SIZES = Object.freeze([100, 50, 25, 10]);
     const HISTORY_PAGE_SIZES = Object.freeze([50, 25, 10]);
     const INTERACTION_PREVIEW_SIZE = 10;
+    const ANALYSIS_BATCH_SIZE = 50;
     // ponytail: 固定阈值足以避开当前网关超时；策略变化时再改为滚动估计。
     const SLOW_QUERY_SECONDS = 8;
     const DAY_MS = 24 * 60 * 60 * 1000;
@@ -1307,7 +1308,7 @@
         return rows;
     }
 
-    async function fetchPullRequests(
+    async function fetchRepositoryData(
         repository,
         token,
         selectedScope,
@@ -1506,9 +1507,27 @@
             if (requestIssues) {
                 progress.push(`Issue ${issues.length}/${issueTotal ?? "?"}`);
             }
+            const progressCurrent =
+                requestPulls && requestIssues
+                    ? pullRequests.length + issues.length
+                    : requestPulls
+                      ? pullRequests.length
+                      : issues.length;
+            const progressTotal =
+                requestPulls && requestIssues
+                    ? (prTotal || 0) + (issueTotal || 0)
+                    : requestPulls
+                      ? prTotal
+                      : issueTotal;
             onProgress(
                 `GraphQL 第 ${page} 次请求完成；对象上限 ${pageSize}/页；${progress.join("，")}；cost ${rateLimit.cost}；耗时 ${requestSeconds} 秒`,
                 rateLimit,
+                {
+                    value: progressTotal
+                        ? (100 * progressCurrent) / progressTotal
+                        : null,
+                    label: `读取数据：${progress.join("，")}`,
+                },
             );
             const nextPageSize = pageSizes[pageSizeIndex + 1];
             if (
@@ -1525,6 +1544,11 @@
         }
 
         if (selectedOptions.completeInteractions) {
+            onProgress(
+                "GraphQL 基础数据读取完成；开始读取完整互动数据",
+                null,
+                { value: null, label: "读取数据：补全评论与 Review" },
+            );
             await fetchCompleteInteractions(
                 repository,
                 token,
@@ -1539,6 +1563,10 @@
 
         let commitResult = { entries: null, status: null };
         if (selectedOptions.includeCommits) {
+            onProgress("开始读取 Commit 贡献者统计", null, {
+                value: null,
+                label: "读取数据：Commit 贡献者统计",
+            });
             commitResult = await fetchCommitContributors(
                 repository,
                 token,
@@ -1548,23 +1576,10 @@
             );
         }
 
-        const commitStats = analyzeCommitContributors(commitResult.entries);
-        const contributorStats = buildContributorStatistics(
-            pullRequests,
-            issues,
-            commitResult.entries,
-            selectedScope === "all",
-        );
-
         // ponytail: exact inline comments are opt-in because Open scope costs at
         // least one REST request per PR; exact per-commit history is intentionally
         // replaced by GitHub's single cached contributor-statistics endpoint.
         return {
-            rows: pullRequests.map((pr) => analyzePullRequest(pr)),
-            issueRows: issues.map((issue) => analyzeIssue(issue)),
-            contributors: contributorStats,
-            commitStats,
-            overflow: collectOverflow(pullRequests, issues),
             coverage: {
                 fullHistory: selectedScope === "all",
                 issues: selectedOptions.includeIssues,
@@ -1584,6 +1599,84 @@
             },
             rateLimits,
             usage,
+        };
+    }
+
+    function yieldToUi() {
+        return new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    async function analyzeRepositoryData(fetchedData, onProgress = () => {}) {
+        const pullRequests = fetchedData.raw.pullRequests || [];
+        const issues = fetchedData.raw.issues || [];
+        const commitEntries = fetchedData.raw.commitContributors;
+        const rows = [];
+        const issueRows = [];
+        const totalItems = pullRequests.length + issues.length;
+        const analysisNow = Date.now();
+        let processed = 0;
+
+        const report = async (message, value) => {
+            onProgress(message, { value, label: message });
+            await yieldToUi();
+        };
+        const itemProgress = () =>
+            totalItems ? (80 * processed) / totalItems : 80;
+
+        await report(
+            `本地分析开始；待处理 ${pullRequests.length} 个 PR、${issues.length} 个 Issue；此阶段不调用 GitHub API`,
+            0,
+        );
+        for (let index = 0; index < pullRequests.length; index += 1) {
+            rows.push(analyzePullRequest(pullRequests[index], analysisNow));
+            processed += 1;
+            if (
+                (index + 1) % ANALYSIS_BATCH_SIZE === 0 ||
+                index + 1 === pullRequests.length
+            ) {
+                const value = itemProgress();
+                await report(
+                    `本地分析 PR ${index + 1}/${pullRequests.length}；总进度 ${value.toFixed(1)}%`,
+                    value,
+                );
+            }
+        }
+        for (let index = 0; index < issues.length; index += 1) {
+            issueRows.push(analyzeIssue(issues[index], analysisNow));
+            processed += 1;
+            if (
+                (index + 1) % ANALYSIS_BATCH_SIZE === 0 ||
+                index + 1 === issues.length
+            ) {
+                const value = itemProgress();
+                await report(
+                    `本地分析 Issue ${index + 1}/${issues.length}；总进度 ${value.toFixed(1)}%`,
+                    value,
+                );
+            }
+        }
+
+        await report("正在聚合贡献者活跃度与身份…", 85);
+        const contributorStats = buildContributorStatistics(
+            pullRequests,
+            issues,
+            commitEntries,
+            fetchedData.coverage.fullHistory,
+        );
+        await report("贡献者聚合完成；正在汇总 Commit 分布…", 95);
+        const commitStats = analyzeCommitContributors(commitEntries);
+        onProgress("本地指标计算完成；准备生成统计图表…", {
+            value: 98,
+            label: "本地指标计算完成",
+        });
+
+        return {
+            ...fetchedData,
+            rows,
+            issueRows,
+            contributors: contributorStats,
+            commitStats,
+            overflow: collectOverflow(pullRequests, issues),
         };
     }
 
@@ -1768,6 +1861,13 @@
                 "从已采集事件聚合",
                 "否",
                 "0 请求；完整度取决于范围与互动开关",
+                "低",
+            ],
+            [
+                "统计指标与图表",
+                "全部原始数据读取完成后本地分批分析",
+                "否",
+                "0 API；每 50 条更新进度",
                 "低",
             ],
             [
@@ -2319,6 +2419,19 @@
         ui.log.scrollTop = ui.log.scrollHeight;
     }
 
+    function setProgress(value, label) {
+        ui.progressWrap.hidden = false;
+        ui.progressLabel.textContent = label;
+        if (!Number.isFinite(value)) {
+            ui.progress.removeAttribute("value");
+            ui.progressPercent.textContent = "进行中";
+            return;
+        }
+        const normalized = Math.max(0, Math.min(100, value));
+        ui.progress.value = normalized;
+        ui.progressPercent.textContent = `${normalized.toFixed(1)}%`;
+    }
+
     function setLoading(value) {
         loading = value;
         ui.analyze.disabled = value;
@@ -2369,6 +2482,7 @@
         }
         ui.issueSection.hidden = true;
         ui.commitSection.hidden = true;
+        ui.progressWrap.hidden = true;
         ui.export.disabled = true;
     }
 
@@ -2436,8 +2550,9 @@
         overflowItems = [];
         setLoading(true);
         resetOutput();
+        setProgress(null, "读取数据：准备请求 GitHub API");
         setStatus(
-            `开始分析 ${currentRepository.owner}/${currentRepository.name}；范围：${
+            `开始读取 ${currentRepository.owner}/${currentRepository.name} 的原始数据；范围：${
                 requestedScope === "open" ? "仅 Open" : "全部历史"
             }；低额度策略：${strategy}；${modules}`,
         );
@@ -2446,20 +2561,24 @@
             baselineRateLimits = await fetchRateLimits(token);
             lastRateLimits = baselineRateLimits;
             setStatus(
-                `分析前额度基线（通过 /rate_limit 查询，不消耗 REST 主额度）；${formatRateLimits(baselineRateLimits)}`,
+                `读取前额度基线（通过 /rate_limit 查询，不消耗 REST 主额度）；${formatRateLimits(baselineRateLimits)}`,
             );
         } catch (error) {
             setStatus(
-                `分析前额度查询失败，继续分析；${error.message || String(error)}`,
+                `读取前额度查询失败，继续读取；${error.message || String(error)}`,
             );
         }
+        let phase = "fetch";
         try {
-            const result = await fetchPullRequests(
+            const fetchedData = await fetchRepositoryData(
                 currentRepository,
                 token,
                 requestedScope,
-                (message, rateLimit) => {
+                (message, rateLimit, progress) => {
                     rememberRateLimit(rateLimit);
+                    if (progress) {
+                        setProgress(progress.value, progress.label);
+                    }
                     setStatus(
                         `${message}${
                             rateLimit
@@ -2471,31 +2590,61 @@
                 requestedOptions,
                 baselineRateLimits,
             );
-            analysis = result;
-            analyzedScope = requestedScope;
-            analyzedOptions = requestedOptions;
-            overflowItems = result.overflow;
             lastRateLimits = {
                 rest:
-                    result.rateLimits.rest || baselineRateLimits?.rest || null,
+                    fetchedData.rateLimits.rest ||
+                    baselineRateLimits?.rest ||
+                    null,
                 graphql:
-                    result.rateLimits.graphql ||
+                    fetchedData.rateLimits.graphql ||
                     baselineRateLimits?.graphql ||
                     null,
             };
-            analysis.rateLimits = lastRateLimits;
-            lastUsage = result.usage;
+            lastUsage = fetchedData.usage;
             const rateLimitChange = formatRateLimitChange(
                 baselineRateLimits,
                 lastRateLimits,
             );
             if (rateLimitChange) {
                 setStatus(
-                    `分析后额度（来自 API 响应）；${formatRateLimits()}；${rateLimitChange}`,
+                    `数据读取完成后的额度；${formatRateLimits()}；${rateLimitChange}`,
                 );
             }
+            setProgress(100, "原始数据读取完成");
+            setStatus(
+                `原始数据读取完成：${fetchedData.raw.pullRequests.length} 个 PR、${fetchedData.raw.issues.length} 个 Issue；所有 GitHub API 请求已结束，开始本地分析`,
+                "success",
+            );
+            await yieldToUi();
+
+            phase = "analysis";
+            const result = await analyzeRepositoryData(
+                fetchedData,
+                (message, progress) => {
+                    setProgress(progress.value, progress.label);
+                    setStatus(message);
+                },
+            );
+            analysis = result;
+            analyzedScope = requestedScope;
+            analyzedOptions = requestedOptions;
+            overflowItems = result.overflow;
+            analysis.rateLimits = lastRateLimits;
             render();
+            setProgress(100, "分析与图表生成完成");
         } catch (error) {
+            const currentProgress = ui.progress.hasAttribute("value")
+                ? ui.progress.value
+                : 0;
+            if (phase === "analysis") {
+                setProgress(currentProgress, "本地分析失败");
+                setStatus(
+                    `本地分析失败；原始数据已经读取完成，本阶段没有调用 GitHub API；${error.message || String(error)}`,
+                    "error",
+                );
+                return;
+            }
+            setProgress(currentProgress, "数据读取失败");
             let quotaDetails = "";
             try {
                 lastRateLimits = await fetchRateLimits(token);
@@ -2656,6 +2805,9 @@
             #status { margin: 10px 0; color: var(--muted); overflow-wrap: anywhere; }
             #status[data-type="error"] { color: #cf222e; }
             #status[data-type="success"] { color: #1a7f37; }
+            #progress-wrap { margin: 8px 0 10px; }
+            #progress-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 4px; color: var(--muted); font-size: 12px; }
+            #progress { width: 100%; height: 12px; accent-color: var(--accent); }
             #log { max-height: 160px; overflow: auto; margin: 8px 0 0; padding: 8px; color: var(--text); background: var(--muted-bg); border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
             .section { margin-top: 18px; }
             .section h3 { margin: 0 0 8px; font-size: 15px; }
@@ -2729,6 +2881,10 @@
                 <label title="Open 模式至少每个 PR 一次 REST；全部历史按每 100 条行内评论一次 REST"><input id="complete-interactions" type="checkbox">完整互动（高成本）</label>
               </div>
               <p id="status">请选择范围和选项，然后点击“开始分析”</p>
+              <div id="progress-wrap" hidden>
+                <div id="progress-head"><span id="progress-label"></span><strong id="progress-percent"></strong></div>
+                <progress id="progress" max="100" value="0" aria-labelledby="progress-label"></progress>
+              </div>
               <section class="section">
                 <h3>Pull Request</h3>
                 <div id="cards" class="cards"></div>
@@ -2777,6 +2933,7 @@
                 中文判定：标题或原始正文任一处含中文。主 GraphQL 查询只请求评论/Review 的作者、身份关系、发布时间和修改时间，不请求正文；“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
                 stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
                 核心贡献者默认指内部成员，或达到 5 个合并 PR、10 次 Review、20 个 Commit 任一阈值。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
+                执行流程严格分为“读取原始数据”和“本地分析”两个阶段；只有读取阶段访问 GitHub API，本地分析每处理 50 条更新一次日志和进度条。
               </p>
             </main>
           </section>
@@ -2800,6 +2957,10 @@
             includeDraftHistory: get("#include-draft-history"),
             completeInteractions: get("#complete-interactions"),
             status: get("#status"),
+            progressWrap: get("#progress-wrap"),
+            progress: get("#progress"),
+            progressLabel: get("#progress-label"),
+            progressPercent: get("#progress-percent"),
             log: get("#log"),
             cards: get("#cards"),
             prCharts: get("#pr-charts"),
@@ -2924,10 +3085,11 @@
             analyzePullRequest,
             analyzeIssue,
             analyzeCommitContributors,
+            analyzeRepositoryData,
             barChartMarkup,
             buildContributorStatistics,
             classifyLanguage,
-            fetchPullRequests,
+            fetchRepositoryData,
             fetchRateLimits,
             formatRateLimit,
             formatRateLimitChange,

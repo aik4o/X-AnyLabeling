@@ -157,6 +157,47 @@ assert.match(chartMarkup, /width:75\.00%/);
 assert.match(chartMarkup, /维护者 &lt;回复&gt;/);
 assert.match(chartMarkup, /tone-green/);
 
+async function testSeparatedLocalAnalysis() {
+    const progress = [];
+    const originalRequest = global.GM_xmlhttpRequest;
+    global.GM_xmlhttpRequest = () => {
+        throw new Error("本地分析不应调用 API");
+    };
+    try {
+        const result = await stats.analyzeRepositoryData(
+            {
+                raw: {
+                    repository: { owner: "o", name: "r" },
+                    scope: "all",
+                    options: {},
+                    fetchedAt: "2026-03-10T00:00:00Z",
+                    pullRequests: [pr],
+                    issues: [issue],
+                    commitContributors: commitEntries,
+                },
+                coverage: { fullHistory: true },
+                rateLimits: { graphql: null, rest: null },
+                usage: {},
+            },
+            (message, state) => progress.push({ message, ...state }),
+        );
+
+        assert.equal(result.rows.length, 1);
+        assert.equal(result.issueRows.length, 1);
+        assert.equal(result.commitStats.totalCommits, 40);
+        assert.deepEqual(
+            progress.map((item) => item.value),
+            [0, 40, 80, 85, 95, 98],
+        );
+        assert.match(
+            progress.map((item) => item.message).join("\n"),
+            /本地分析 PR 1\/1.*本地分析 Issue 1\/1.*贡献者聚合完成/s,
+        );
+    } finally {
+        global.GM_xmlhttpRequest = originalRequest;
+    }
+}
+
 async function testAllHistorySplitsPullsAndIssues() {
     const requests = [];
     global.GM_xmlhttpRequest = ({ data, onload }) => {
@@ -201,7 +242,7 @@ async function testAllHistorySplitsPullsAndIssues() {
         });
     };
 
-    await stats.fetchPullRequests(
+    const fetched = await stats.fetchRepositoryData(
         { owner: "o", name: "r" },
         "token",
         "all",
@@ -213,6 +254,9 @@ async function testAllHistorySplitsPullsAndIssues() {
             completeInteractions: false,
         },
     );
+    assert.equal("rows" in fetched, false);
+    assert.deepEqual(fetched.raw.pullRequests, []);
+    assert.deepEqual(fetched.raw.issues, []);
 
     assert.deepEqual(
         requests.map(({ fetchPulls, fetchIssues, pageSize }) => ({
@@ -230,7 +274,7 @@ async function testAllHistorySplitsPullsAndIssues() {
     assert.doesNotMatch(requests[0].query, /id url/);
 
     requests.length = 0;
-    await stats.fetchPullRequests(
+    await stats.fetchRepositoryData(
         { owner: "o", name: "r" },
         "token",
         "open",
@@ -291,7 +335,7 @@ async function testGraphqlErrorDetails() {
     };
 
     await assert.rejects(
-        stats.fetchPullRequests(
+        stats.fetchRepositoryData(
             { owner: "o", name: "r" },
             "token",
             "all",
@@ -400,7 +444,7 @@ async function testSafeGraphqlPageFallback() {
         });
     };
 
-    const result = await stats.fetchPullRequests(
+    const result = await stats.fetchRepositoryData(
         { owner: "o", name: "r" },
         "token",
         "all",
@@ -473,7 +517,7 @@ async function testSlowPageDownshiftsWithoutRetry() {
     };
 
     try {
-        await stats.fetchPullRequests(
+        await stats.fetchRepositoryData(
             { owner: "o", name: "r" },
             "token",
             "all",
@@ -539,7 +583,8 @@ async function testRateLimitLookup() {
     );
 }
 
-testAllHistorySplitsPullsAndIssues()
+testSeparatedLocalAnalysis()
+    .then(testAllHistorySplitsPullsAndIssues)
     .then(testGraphqlErrorDetails)
     .then(testSafeGraphqlPageFallback)
     .then(testSlowPageDownshiftsWithoutRetry)
