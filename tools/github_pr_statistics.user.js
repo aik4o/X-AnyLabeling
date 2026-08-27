@@ -2,7 +2,7 @@
 // @name         GitHub PR 中英文统计
 // @name:en      GitHub PR Language Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.1.0
+// @version      0.1.1
 // @description  统计仓库中英文 PR 的合并率、提交者/维护者回复率和维护者最近回复时间
 // @description:en Analyze PR language, merge rate, reply rate, and latest maintainer reply
 // @match        https://github.com/*/*
@@ -26,11 +26,12 @@
         "COLLABORATOR",
     ]);
     const QUERY = `
-        query($owner: String!, $name: String!, $cursor: String) {
+        query($owner: String!, $name: String!, $states: [PullRequestState!], $cursor: String) {
           repository(owner: $owner, name: $name) {
             pullRequests(
-              first: 20
+              first: 100
               after: $cursor
+              states: $states
               orderBy: {field: CREATED_AT, direction: ASC}
             ) {
               pageInfo { hasNextPage endCursor }
@@ -58,7 +59,7 @@
                     submittedAt
                   }
                 }
-                reviewThreads(first: 100) {
+                reviewThreads(first: 40) {
                   pageInfo { hasNextPage }
                   nodes {
                     comments(first: 100) {
@@ -81,7 +82,8 @@
     let ui;
     let currentRepository;
     let analyzedRows = null;
-    let scope = "all";
+    let scope = "open";
+    let analyzedScope = null;
     let loading = false;
     let lastRateLimit = null;
     let overflowPrs = [];
@@ -259,7 +261,12 @@
         );
     }
 
-    async function fetchPullRequests(repository, token, onProgress) {
+    async function fetchPullRequests(
+        repository,
+        token,
+        selectedScope,
+        onProgress,
+    ) {
         const pullRequests = [];
         const overflow = [];
         let cursor = null;
@@ -271,6 +278,7 @@
             const data = await requestGraphQL(token, {
                 owner: repository.owner,
                 name: repository.name,
+                states: selectedScope === "open" ? ["OPEN"] : null,
                 cursor,
             });
             if (!data.repository) {
@@ -290,8 +298,8 @@
             onProgress(pullRequests.length, page, rateLimit);
         }
 
-        // ponytail: discussions are capped at 100 items per PR; paginate the
-        // affected PR separately if the UI warning ever appears.
+        // ponytail: review threads are capped at 40 and other discussions at
+        // 100 so a 100-PR page stays within GitHub's GraphQL query limits.
         return {
             rows: pullRequests.map(analyzePullRequest),
             overflow,
@@ -487,7 +495,7 @@
         `;
 
         const warning = overflowPrs.length
-            ? `；PR #${overflowPrs.join(", #")} 的讨论超过 100 条，回复统计为下限`
+            ? `；PR #${overflowPrs.join(", #")} 的讨论数据超过单次检索上限，回复统计为下限`
             : "";
         const rateLimit = lastRateLimit
             ? `；API 剩余 ${lastRateLimit.remaining}，重置时间 ${formatDate(
@@ -508,6 +516,8 @@
     function setLoading(value) {
         loading = value;
         ui.analyze.disabled = value;
+        ui.scopeAll.disabled = value;
+        ui.scopeOpen.disabled = value;
         ui.analyze.textContent = value ? "分析中…" : "重新分析";
     }
 
@@ -520,6 +530,7 @@
             return;
         }
 
+        const requestedScope = scope;
         setLoading(true);
         ui.cards.innerHTML = "";
         ui.table.innerHTML = "";
@@ -528,12 +539,14 @@
             const result = await fetchPullRequests(
                 currentRepository,
                 token,
+                requestedScope,
                 (count, page, rateLimit) => {
                     lastRateLimit = rateLimit;
                     setStatus(`已读取 ${count} 个 PR（第 ${page} 页）…`);
                 },
             );
             analyzedRows = result.rows;
+            analyzedScope = requestedScope;
             overflowPrs = result.overflow;
             lastRateLimit = result.rateLimit;
             render();
@@ -554,7 +567,8 @@
         ui.token.value = "";
         ui.settings.open = false;
         updateTokenState();
-        setStatus("Token 已保存，可以开始分析", "success");
+        setStatus("Token 已保存，正在分析…", "success");
+        runAnalysis();
     }
 
     function clearToken() {
@@ -687,8 +701,8 @@
             <main>
               <div class="toolbar">
                 <div class="scope" aria-label="统计范围">
-                  <button id="scope-all" class="active">全部 PR</button>
-                  <button id="scope-open">仅 Open</button>
+                  <button id="scope-all">全部 PR</button>
+                  <button id="scope-open" class="active">仅 Open</button>
                 </div>
                 <button id="analyze" class="button primary">开始分析</button>
               </div>
@@ -741,6 +755,7 @@
                 "aria-expanded",
                 String(!ui.panel.hidden),
             );
+            if (!ui.panel.hidden && !analyzedRows) runAnalysis();
         });
         ui.close.addEventListener("click", () => {
             ui.panel.hidden = true;
@@ -758,10 +773,18 @@
     }
 
     function setScope(value) {
+        if (loading || value === scope) return;
         scope = value;
         ui.scopeAll.classList.toggle("active", value === "all");
         ui.scopeOpen.classList.toggle("active", value === "open");
-        render();
+        if (
+            analyzedRows &&
+            (analyzedScope === "all" || analyzedScope === value)
+        ) {
+            render();
+        } else if (!ui.panel.hidden) {
+            runAnalysis();
+        }
     }
 
     function handleRouteChange() {
@@ -781,6 +804,7 @@
         ui.title.textContent = `${repository.owner}/${repository.name} PR 统计`;
         if (changed) {
             analyzedRows = null;
+            analyzedScope = null;
             overflowPrs = [];
             lastRateLimit = null;
             ui.cards.innerHTML = "";
