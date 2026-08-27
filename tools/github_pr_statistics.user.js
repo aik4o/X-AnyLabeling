@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.3
+// @version      0.6.4
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -839,6 +839,15 @@
         return { owner: parts[0], name: parts[1] };
     }
 
+    function isRetryableGraphqlFailure(error) {
+        return (
+            [500, 502, 503, 504].includes(Number(error?.status)) ||
+            /请求超时|respond to your request in time|timed out|timeout/i.test(
+                String(error?.message || error || ""),
+            )
+        );
+    }
+
     function requestGraphQL(query, token, variables) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -915,16 +924,16 @@
                         return;
                     }
                     if (payload.errors?.length) {
-                        reject(
-                            new Error(
-                                formatApiError(
-                                    payload.errors
-                                        .map((error) => error.message)
-                                        .join("；"),
-                                    response,
-                                ),
+                        const error = new Error(
+                            formatApiError(
+                                payload.errors
+                                    .map((item) => item.message)
+                                    .join("；"),
+                                response,
                             ),
                         );
+                        error.status = response.status;
+                        reject(error);
                         return;
                     }
                     resolve(payload.data);
@@ -1376,11 +1385,12 @@
                         MIN_PAGE_SIZE,
                         pageSize - PAGE_SIZE_STEP,
                     );
-                    if (error.status !== 502 || nextPageSize === pageSize) {
+                    const retryable = isRetryableGraphqlFailure(error);
+                    if (!retryable || nextPageSize === pageSize) {
                         const reason =
-                            error.status === 502
+                            retryable
                                 ? `已到最小对象上限 ${pageSize}/页`
-                                : "仅对 HTTP 502 执行安全降级";
+                                : "该错误不是可降级重试的临时 GraphQL 错误";
                         throw new Error(
                             `${failure}；未自动重试：${reason}；${error.message || String(error)}`,
                         );
@@ -1410,6 +1420,8 @@
                     let safeReason = "";
                     if (!afterFailure) {
                         unsafeReason = "额度查询未返回 GraphQL 数据";
+                    } else if (afterFailure.remaining <= 0) {
+                        unsafeReason = `GraphQL 剩余额度为 ${afterFailure.remaining}/${afterFailure.limit}`;
                     } else if (
                         beforeFailure.resetAt !== afterFailure.resetAt
                     ) {
@@ -1422,7 +1434,12 @@
                             unsafeReason = `GraphQL 额度窗口已重置，但新窗口已用 ${afterFailure.used}/${afterFailure.limit}，无法排除失败请求已在新窗口扣点`;
                         }
                     } else if (beforeFailure.used !== afterFailure.used) {
-                        unsafeReason = `GraphQL 已用额度从 ${beforeFailure.used} 变为 ${afterFailure.used}，失败请求可能已扣点`;
+                        const delta = afterFailure.used - beforeFailure.used;
+                        if (delta > 0 && afterFailure.remaining > 0) {
+                            safeReason = `失败请求已扣 ${delta} points，但仍剩余 ${afterFailure.remaining}/${afterFailure.limit}；为保留已读取进度继续降级重试`;
+                        } else {
+                            unsafeReason = `GraphQL 已用额度从 ${beforeFailure.used} 变为 ${afterFailure.used}，无法安全继续`;
+                        }
                     } else {
                         safeReason = `/rate_limit 确认 GraphQL 已用额度仍为 ${afterFailure.used}/${afterFailure.limit}，失败请求未扣点`;
                     }
@@ -1433,7 +1450,7 @@
                     }
 
                     onProgress(
-                        `${failure}；${safeReason}；对象上限 ${pageSize} → ${nextPageSize}/页后自动重试`,
+                        `${failure}；原因：${error.message || String(error)}；${safeReason}；对象上限 ${pageSize} → ${nextPageSize}/页后自动重试`,
                         afterFailure,
                     );
                     pageSize = nextPageSize;

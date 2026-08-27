@@ -386,7 +386,7 @@ async function testSafeGraphqlPageFallback() {
     const logs = [];
     const pageSizes = [];
     const previousReset = 1773104400;
-    const reset = previousReset + 3600;
+    const reset = previousReset;
     const resetAt = new Date(reset * 1000).toISOString();
     global.GM_xmlhttpRequest = ({ url, data, onload }) => {
         if (url === "https://api.github.com/rate_limit") {
@@ -403,8 +403,8 @@ async function testSafeGraphqlPageFallback() {
                         },
                         graphql: {
                             limit: 5000,
-                            used: 0,
-                            remaining: 5000,
+                            used: 103,
+                            remaining: 4897,
                             reset,
                         },
                     },
@@ -417,10 +417,17 @@ async function testSafeGraphqlPageFallback() {
         pageSizes.push(variables.pageSize);
         if (pageSizes.length === 1) {
             onload({
-                status: 502,
-                statusText: "Bad Gateway",
-                responseHeaders: "content-type: text/html\r\n",
-                responseText: "<html>upstream failure</html>",
+                status: 200,
+                statusText: "OK",
+                responseHeaders: "content-type: application/json\r\n",
+                responseText: JSON.stringify({
+                    errors: [
+                        {
+                            message:
+                                "We couldn't respond to your request in time. Sorry about that.",
+                        },
+                    ],
+                }),
             });
             return;
         }
@@ -442,9 +449,9 @@ async function testSafeGraphqlPageFallback() {
                     rateLimit: {
                         cost: 1,
                         limit: 5000,
-                        remaining: 4999,
+                        remaining: 4896,
                         resetAt,
-                        used: 1,
+                        used: 104,
                     },
                 },
             }),
@@ -476,11 +483,9 @@ async function testSafeGraphqlPageFallback() {
     assert.deepEqual(pageSizes, [100, 90]);
     assert.equal(result.usage.graphqlRequests, 1);
     assert.equal(result.usage.graphqlPoints, 1);
-    assert.match(
-        logs.join("\n"),
-        /额度窗口已重置且新窗口为 0\/5000.*可安全重试/,
-    );
+    assert.match(logs.join("\n"), /失败请求已扣 3 points.*仍剩余 4897\/5000/);
     assert.match(logs.join("\n"), /对象上限 100 → 90\/页后自动重试/);
+    assert.match(logs.join("\n"), /原因：We couldn't respond to your request in time/);
 }
 
 async function testPageSizeDropsAndRecoversByTen() {
