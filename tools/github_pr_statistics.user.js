@@ -1,10 +1,10 @@
 // ==UserScript==
-// @name         GitHub PR 中英文统计
-// @name:en      GitHub PR Language Statistics
+// @name         GitHub 仓库贡献统计
+// @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.2.0
-// @description  统计仓库中英文 PR 的合并率、提交者/维护者回复率和维护者最近回复时间
-// @description:en Analyze PR language, merge rate, reply rate, and latest maintainer reply
+// @version      0.3.0
+// @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
+// @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -19,106 +19,124 @@
     "use strict";
 
     const TOKEN_KEY = "github-pr-statistics-token";
+    const OPTIONS_KEY = "github-pr-statistics-options-v1";
+    const DEFAULT_OPTIONS = Object.freeze({
+        includeIssues: true,
+        includeCommits: true,
+        includeDraftHistory: false,
+        completeInteractions: false,
+    });
+    const DAY_MS = 24 * 60 * 60 * 1000;
     const HAN_PATTERN = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/u;
     const MAINTAINER_ASSOCIATIONS = new Set([
         "OWNER",
         "MEMBER",
         "COLLABORATOR",
     ]);
-    const OPEN_COUNT_QUERY = `
-        query($owner: String!, $name: String!) {
-          repository(owner: $owner, name: $name) {
-            pullRequests(first: 1, states: [OPEN]) { totalCount }
-          }
-          rateLimit { cost limit remaining resetAt used }
-        }
-    `;
-    const HISTORY_QUERY = `
-        query($owner: String!, $name: String!, $cursor: String, $pageSize: Int!) {
+    const REPOSITORY_QUERY = `
+        query(
+          $owner: String!
+          $name: String!
+          $prCursor: String
+          $issueCursor: String
+          $prStates: [PullRequestState!]!
+          $issueStates: [IssueState!]!
+          $fetchPulls: Boolean!
+          $fetchIssues: Boolean!
+          $includeDraftHistory: Boolean!
+        ) {
           repository(owner: $owner, name: $name) {
             pullRequests(
-              first: $pageSize
-              after: $cursor
-              states: [OPEN, CLOSED, MERGED]
+              first: 100
+              after: $prCursor
+              states: $prStates
               orderBy: {field: CREATED_AT, direction: ASC}
-            ) {
+            ) @include(if: $fetchPulls) {
               totalCount
               pageInfo { hasNextPage endCursor }
               nodes {
-                number
-                title
-                body
-                url
-                state
-                mergedAt
+                number title body url state
+                createdAt updatedAt closedAt mergedAt
+                lastEditedAt editor { login }
+                isDraft authorAssociation
                 author { login }
+                mergedBy { login }
+                baseRefName headRefName
+                additions deletions changedFiles
+                commits(last: 1) {
+                  totalCount
+                  nodes {
+                    commit {
+                      committedDate
+                      author { user { login } }
+                    }
+                  }
+                }
                 comments(first: 100) {
+                  totalCount
                   pageInfo { hasNextPage }
                   nodes {
+                    id url
                     author { login }
                     authorAssociation
-                    createdAt
+                    createdAt updatedAt
                   }
                 }
                 reviews(first: 100) {
+                  totalCount
                   pageInfo { hasNextPage }
                   nodes {
+                    id url state
                     author { login }
                     authorAssociation
-                    submittedAt
+                    createdAt submittedAt updatedAt
+                  }
+                }
+                timelineItems(
+                  first: 100
+                  itemTypes: [
+                    CONVERT_TO_DRAFT_EVENT
+                    READY_FOR_REVIEW_EVENT
+                  ]
+                ) @include(if: $includeDraftHistory) {
+                  pageInfo { hasNextPage }
+                  nodes {
+                    __typename
+                    ... on ConvertToDraftEvent { createdAt }
+                    ... on ReadyForReviewEvent { createdAt }
                   }
                 }
               }
             }
-          }
-          rateLimit { cost limit remaining resetAt used }
-        }
-    `;
-    const OPEN_INTERACTIONS_QUERY = `
-        query($owner: String!, $name: String!, $cursor: String, $pageSize: Int!) {
-          repository(owner: $owner, name: $name) {
-            pullRequests(
-              first: $pageSize
-              after: $cursor
-              states: [OPEN]
+            issues(
+              first: 100
+              after: $issueCursor
+              states: $issueStates
               orderBy: {field: CREATED_AT, direction: ASC}
-            ) {
+            ) @include(if: $fetchIssues) {
+              totalCount
               pageInfo { hasNextPage endCursor }
               nodes {
-                number
-                title
-                body
-                url
-                state
-                mergedAt
+                number title body url state stateReason
+                createdAt updatedAt closedAt
+                lastEditedAt editor { login }
+                authorAssociation
                 author { login }
+                labels(first: 20) {
+                  pageInfo { hasNextPage }
+                  nodes { name }
+                }
+                closedByPullRequestsReferences(first: 1, includeClosedPrs: true) {
+                  totalCount
+                }
                 comments(first: 100) {
+                  totalCount
                   pageInfo { hasNextPage }
                   nodes {
+                    id url
                     author { login }
                     authorAssociation
-                    createdAt
-                  }
-                }
-                reviews(first: 100) {
-                  pageInfo { hasNextPage }
-                  nodes {
-                    author { login }
-                    authorAssociation
-                    submittedAt
-                  }
-                }
-                reviewThreads(first: 40) {
-                  pageInfo { hasNextPage }
-                  nodes {
-                    comments(first: 100) {
-                      pageInfo { hasNextPage }
-                      nodes {
-                        author { login }
-                        authorAssociation
-                        createdAt
-                      }
-                    }
+                    createdAt updatedAt
                   }
                 }
               }
@@ -130,13 +148,21 @@
 
     let ui;
     let currentRepository;
-    let analyzedRows = null;
+    let analysis = null;
     let scope = "open";
     let analyzedScope = null;
+    let analyzedOptions = null;
     let loading = false;
     let lastRateLimits = { graphql: null, rest: null };
-    let lastUsage = { graphqlPoints: 0, restRequests: 0 };
-    let overflowPrs = [];
+    let lastUsage = {
+        graphqlPoints: 0,
+        graphqlRequests: 0,
+        restRequests: 0,
+        overflowRest: 0,
+        inlineCommentRest: 0,
+        commitStatsRest: 0,
+    };
+    let overflowItems = [];
 
     function classifyLanguage(title, body) {
         return HAN_PATTERN.test(`${title || ""}\n${body || ""}`)
@@ -148,6 +174,30 @@
         return /\[bot\]$/i.test(login || "");
     }
 
+    function eventFrom(item, type, timeField = "createdAt") {
+        return {
+            login: item.author?.login || "",
+            association: item.authorAssociation || "",
+            at: item[timeField] || item.createdAt || null,
+            updatedAt: item.updatedAt || null,
+            type,
+        };
+    }
+
+    function interactionEvents(item) {
+        return [
+            ...(item.comments?.nodes || []).map((event) =>
+                eventFrom(event, "comment"),
+            ),
+            ...(item.reviews?.nodes || []).map((event) =>
+                eventFrom(event, "review", "submittedAt"),
+            ),
+            ...(item.reviewComments || []).map((event) =>
+                eventFrom(event, "review_comment"),
+            ),
+        ].filter((event) => event.login && event.at);
+    }
+
     function latestEvent(events) {
         return events.reduce((latest, event) => {
             if (!event || !event.at) return latest;
@@ -157,71 +207,288 @@
         }, null);
     }
 
-    function analyzePullRequest(pr) {
+    function earliestEvent(events) {
+        return events.reduce((earliest, event) => {
+            if (!event || !event.at) return earliest;
+            return !earliest || Date.parse(event.at) < Date.parse(earliest.at)
+                ? event
+                : earliest;
+        }, null);
+    }
+
+    function hoursBetween(start, end) {
+        if (!start || !end) return null;
+        const value = (Date.parse(end) - Date.parse(start)) / 3600000;
+        return Number.isFinite(value) && value >= 0 ? value : null;
+    }
+
+    function ageInDays(isoDate, now = Date.now()) {
+        if (!isoDate) return null;
+        return Math.max(0, Math.floor((now - Date.parse(isoDate)) / DAY_MS));
+    }
+
+    function isMaintainerEvent(event, author = "") {
+        return (
+            event.login !== author &&
+            !isBot(event.login) &&
+            MAINTAINER_ASSOCIATIONS.has(event.association)
+        );
+    }
+
+    function analyzePullRequest(pr, now = Date.now()) {
         const author = pr.author?.login || "";
-        const threadComments = [
-            ...(pr.reviewComments || []),
-            ...(pr.reviewThreads?.nodes || []).flatMap(
-                (thread) => thread.comments?.nodes || [],
-            ),
-        ];
-        const events = [
-            ...(pr.comments?.nodes || []).map((event) => ({
-                login: event.author?.login || "",
-                association: event.authorAssociation,
-                at: event.createdAt,
-            })),
-            ...(pr.reviews?.nodes || []).map((event) => ({
-                login: event.author?.login || "",
-                association: event.authorAssociation,
-                at: event.submittedAt,
-            })),
-            ...threadComments.map((event) => ({
-                login: event.author?.login || "",
-                association: event.authorAssociation,
-                at: event.createdAt,
-            })),
-        ].filter((event) => event.login && event.at);
+        const events = interactionEvents(pr);
         const maintainerEvents = events
-            .filter(
-                (event) =>
-                    event.login !== author &&
-                    !isBot(event.login) &&
-                    MAINTAINER_ASSOCIATIONS.has(event.association),
-            )
+            .filter((event) => isMaintainerEvent(event, author))
             .map((event) => ({
                 ...event,
                 number: pr.number,
                 title: pr.title,
                 url: pr.url,
             }));
+        const humanEvents = events.filter((event) => !isBot(event.login));
+        if (author && !isBot(author) && pr.createdAt) {
+            humanEvents.push({
+                login: author,
+                association: pr.authorAssociation,
+                at: pr.createdAt,
+                type: "pull_request",
+            });
+        }
+        if (pr.editor?.login && !isBot(pr.editor.login) && pr.lastEditedAt) {
+            humanEvents.push({
+                login: pr.editor.login,
+                association: "",
+                at: pr.lastEditedAt,
+                type: "body_edit",
+            });
+        }
+        const lastCommit = pr.commits?.nodes?.[0]?.commit;
+        const lastCommitAuthor = lastCommit?.author?.user?.login || "";
+        if (lastCommitAuthor && !isBot(lastCommitAuthor) && lastCommit.committedDate) {
+            humanEvents.push({
+                login: lastCommitAuthor,
+                association: "",
+                at: lastCommit.committedDate,
+                type: "commit",
+            });
+        }
+        const firstResponse = earliestEvent(
+            events.filter(
+                (event) => event.login !== author && !isBot(event.login),
+            ),
+        );
+        const firstMaintainerReply = earliestEvent(maintainerEvents);
+        const lastHumanActivity = latestEvent(humanEvents);
+        const draftEvents = pr.timelineItems?.nodes || [];
+        const draftHistoryKnown = Boolean(pr.isDraft || pr.timelineItems);
+        const everDraft =
+            Boolean(pr.isDraft) ||
+            draftEvents.some((event) =>
+                [
+                    "ConvertToDraftEvent",
+                    "ReadyForReviewEvent",
+                ].includes(event.__typename),
+            );
+        const staleDays = ageInDays(
+            lastHumanActivity?.at || pr.createdAt,
+            now,
+        );
 
         return {
             number: pr.number,
             title: pr.title,
+            body: pr.body,
             url: pr.url,
+            author,
+            authorAssociation: pr.authorAssociation,
+            createdAt: pr.createdAt,
+            updatedAt: pr.updatedAt,
+            lastEditedAt: pr.lastEditedAt,
+            closedAt: pr.closedAt,
+            mergedAt: pr.mergedAt,
             language: classifyLanguage(pr.title, pr.body),
             merged: Boolean(pr.mergedAt),
             open: pr.state === "OPEN",
+            closedWithoutMerge: pr.state === "CLOSED" && !pr.mergedAt,
+            currentDraft: Boolean(pr.isDraft),
+            everDraft,
+            draftHistoryKnown,
+            draftHistoryComplete:
+                Boolean(pr.timelineItems) &&
+                !pr.timelineItems.pageInfo?.hasNextPage,
             submitterReplied: events.some((event) => event.login === author),
             maintainerReplied: maintainerEvents.length > 0,
             latestMaintainerReply: latestEvent(maintainerEvents),
+            firstResponse,
+            firstMaintainerReply,
+            firstResponseHours: hoursBetween(
+                pr.createdAt,
+                firstResponse?.at,
+            ),
+            firstMaintainerResponseHours: hoursBetween(
+                pr.createdAt,
+                firstMaintainerReply?.at,
+            ),
+            mergeHours: hoursBetween(pr.createdAt, pr.mergedAt),
+            closeHours: hoursBetween(pr.createdAt, pr.closedAt),
+            lastHumanActivity,
+            staleDays,
+            stale30: pr.state === "OPEN" && staleDays >= 30,
+            stale90: pr.state === "OPEN" && staleDays >= 90,
+            externalAuthor: !MAINTAINER_ASSOCIATIONS.has(
+                pr.authorAssociation,
+            ),
+            conversationComments: pr.comments?.totalCount || 0,
+            reviews: pr.reviews?.totalCount || 0,
+            inlineReviewComments: (pr.reviewComments || []).length,
+            interactionsComplete:
+                !pr.comments?.pageInfo?.hasNextPage &&
+                !pr.reviews?.pageInfo?.hasNextPage &&
+                Boolean(pr.inlineCommentsComplete),
+            additions: pr.additions || 0,
+            deletions: pr.deletions || 0,
+            changedFiles: pr.changedFiles || 0,
+            commits: pr.commits?.totalCount || 0,
         };
+    }
+
+    function issueCategories(labels) {
+        const names = labels.map((name) => name.toLowerCase());
+        const has = (pattern) => names.some((name) => pattern.test(name));
+        return {
+            bug: has(/bug|defect|错误|缺陷/),
+            feature: has(/feature|enhancement|功能|改进/),
+            docs: has(/doc|documentation|文档/),
+            goodFirst: has(/good[ -]?first|初次|新手/),
+            helpWanted: has(/help[ -]?wanted|需要帮助/),
+        };
+    }
+
+    function analyzeIssue(issue, now = Date.now()) {
+        const author = issue.author?.login || "";
+        const events = (issue.comments?.nodes || [])
+            .map((event) => eventFrom(event, "issue_comment"))
+            .filter((event) => event.login && event.at);
+        const maintainerEvents = events
+            .filter((event) => isMaintainerEvent(event, author))
+            .map((event) => ({
+                ...event,
+                number: issue.number,
+                title: issue.title,
+                url: issue.url,
+            }));
+        const humanEvents = events.filter((event) => !isBot(event.login));
+        if (author && !isBot(author) && issue.createdAt) {
+            humanEvents.push({
+                login: author,
+                association: issue.authorAssociation,
+                at: issue.createdAt,
+                type: "issue",
+            });
+        }
+        if (
+            issue.editor?.login &&
+            !isBot(issue.editor.login) &&
+            issue.lastEditedAt
+        ) {
+            humanEvents.push({
+                login: issue.editor.login,
+                association: "",
+                at: issue.lastEditedAt,
+                type: "body_edit",
+            });
+        }
+        const firstResponse = earliestEvent(
+            events.filter(
+                (event) => event.login !== author && !isBot(event.login),
+            ),
+        );
+        const firstMaintainerReply = earliestEvent(maintainerEvents);
+        const lastHumanActivity = latestEvent(humanEvents);
+        const staleDays = ageInDays(
+            lastHumanActivity?.at || issue.createdAt,
+            now,
+        );
+        const labels = (issue.labels?.nodes || []).map((label) => label.name);
+
+        return {
+            number: issue.number,
+            title: issue.title,
+            body: issue.body,
+            url: issue.url,
+            author,
+            authorAssociation: issue.authorAssociation,
+            state: issue.state,
+            stateReason: issue.stateReason,
+            createdAt: issue.createdAt,
+            updatedAt: issue.updatedAt,
+            lastEditedAt: issue.lastEditedAt,
+            closedAt: issue.closedAt,
+            open: issue.state === "OPEN",
+            labels,
+            categories: issueCategories(labels),
+            comments: issue.comments?.totalCount || 0,
+            commentsComplete: !issue.comments?.pageInfo?.hasNextPage,
+            firstResponse,
+            firstMaintainerReply,
+            firstResponseHours: hoursBetween(
+                issue.createdAt,
+                firstResponse?.at,
+            ),
+            firstMaintainerResponseHours: hoursBetween(
+                issue.createdAt,
+                firstMaintainerReply?.at,
+            ),
+            maintainerReplied: maintainerEvents.length > 0,
+            latestMaintainerReply: latestEvent(maintainerEvents),
+            noResponse: !firstResponse,
+            resolutionHours: hoursBetween(issue.createdAt, issue.closedAt),
+            closedByPr:
+                (issue.closedByPullRequestsReferences?.totalCount || 0) > 0,
+            lastHumanActivity,
+            staleDays,
+            stale30: issue.state === "OPEN" && staleDays >= 30,
+            stale90: issue.state === "OPEN" && staleDays >= 90,
+        };
+    }
+
+    function median(values) {
+        const sorted = values
+            .filter((value) => Number.isFinite(value))
+            .sort((a, b) => a - b);
+        if (!sorted.length) return null;
+        const middle = Math.floor(sorted.length / 2);
+        return sorted.length % 2
+            ? sorted[middle]
+            : (sorted[middle - 1] + sorted[middle]) / 2;
     }
 
     function groupStatistics(rows) {
         return {
             count: rows.length,
             merged: rows.filter((row) => row.merged).length,
+            closedWithoutMerge: rows.filter((row) => row.closedWithoutMerge)
+                .length,
             submitterReplied: rows.filter((row) => row.submitterReplied).length,
             maintainerReplied: rows.filter((row) => row.maintainerReplied).length,
+            currentDraft: rows.filter((row) => row.currentDraft).length,
+            everDraft: rows.filter((row) => row.everDraft).length,
+            draftKnown: rows.filter((row) => row.draftHistoryKnown).length,
+            stale30: rows.filter((row) => row.stale30).length,
+            stale90: rows.filter((row) => row.stale90).length,
+            medianFirstMaintainerResponseHours: median(
+                rows.map((row) => row.firstMaintainerResponseHours),
+            ),
+            medianMergeHours: median(rows.map((row) => row.mergeHours)),
+            medianCloseHours: median(rows.map((row) => row.closeHours)),
             latestMaintainerReply: latestEvent(
                 rows.map((row) => row.latestMaintainerReply).filter(Boolean),
             ),
         };
     }
 
-    function summarize(rows, selectedScope) {
+    function summarizePullRequests(rows, selectedScope) {
         const scopedRows =
             selectedScope === "open" ? rows.filter((row) => row.open) : rows;
         return {
@@ -234,6 +501,260 @@
             ),
         };
     }
+
+    function summarizeIssues(rows, selectedScope) {
+        const scopedRows =
+            selectedScope === "open" ? rows.filter((row) => row.open) : rows;
+        const categories = ["bug", "feature", "docs", "goodFirst", "helpWanted"];
+        return {
+            count: scopedRows.length,
+            open: scopedRows.filter((row) => row.open).length,
+            closed: scopedRows.filter((row) => !row.open).length,
+            noResponse: scopedRows.filter((row) => row.noResponse).length,
+            maintainerReplied: scopedRows.filter((row) => row.maintainerReplied)
+                .length,
+            closedByPr: scopedRows.filter((row) => row.closedByPr).length,
+            stale30: scopedRows.filter((row) => row.stale30).length,
+            stale90: scopedRows.filter((row) => row.stale90).length,
+            medianFirstResponseHours: median(
+                scopedRows.map((row) => row.firstResponseHours),
+            ),
+            medianFirstMaintainerResponseHours: median(
+                scopedRows.map((row) => row.firstMaintainerResponseHours),
+            ),
+            medianResolutionHours: median(
+                scopedRows.map((row) => row.resolutionHours),
+            ),
+            latestMaintainerReply: latestEvent(
+                scopedRows
+                    .map((row) => row.latestMaintainerReply)
+                    .filter(Boolean),
+            ),
+            categories: Object.fromEntries(
+                categories.map((category) => [
+                    category,
+                    scopedRows.filter((row) => row.categories[category]).length,
+                ]),
+            ),
+        };
+    }
+
+    function analyzeCommitContributors(entries) {
+        if (!Array.isArray(entries)) return null;
+        const authors = entries
+            .map((entry) => ({
+                login: entry.author?.login || "(匿名或已删除账号)",
+                total: Number(entry.total) || 0,
+                weeks: Array.isArray(entry.weeks) ? entry.weeks : [],
+            }))
+            .sort((a, b) => b.total - a.total);
+        const totalCommits = authors.reduce((sum, author) => sum + author.total, 0);
+        const weekly = new Map();
+        for (const author of authors) {
+            for (const week of author.weeks) {
+                weekly.set(week.w, (weekly.get(week.w) || 0) + (week.c || 0));
+            }
+        }
+        const activeWeeks = [...weekly.entries()]
+            .filter(([, count]) => count > 0)
+            .sort(([left], [right]) => left - right);
+        const monthlyMap = new Map();
+        for (const [week, count] of activeWeeks) {
+            const month = new Date(week * 1000).toISOString().slice(0, 7);
+            monthlyMap.set(month, (monthlyMap.get(month) || 0) + count);
+        }
+        const share = (count) =>
+            totalCommits
+                ? authors.slice(0, count).reduce((sum, row) => sum + row.total, 0) /
+                  totalCommits
+                : 0;
+        return {
+            authors,
+            contributorCount: authors.length,
+            totalCommits,
+            recentCommits: activeWeeks.reduce((sum, [, count]) => sum + count, 0),
+            top1Share: share(1),
+            top3Share: share(3),
+            top5Share: share(5),
+            lastActiveWeek: activeWeeks.length
+                ? new Date(activeWeeks.at(-1)[0] * 1000).toISOString()
+                : null,
+            monthly: [...monthlyMap.entries()].slice(-12),
+        };
+    }
+
+    function buildContributorStatistics(
+        pullRequests,
+        issues,
+        commitEntries,
+        fullHistory,
+    ) {
+        const people = new Map();
+        const person = (login) => {
+            if (!login) return null;
+            if (!people.has(login)) {
+                people.set(login, {
+                    login,
+                    associations: new Set(),
+                    activityMonths: new Set(),
+                    firstActivityAt: null,
+                    lastActivityAt: null,
+                    prCount: 0,
+                    mergedPrCount: 0,
+                    issueCount: 0,
+                    commentCount: 0,
+                    reviewCount: 0,
+                    commitCount: 0,
+                    firstTimeContributorObserved: false,
+                });
+            }
+            return people.get(login);
+        };
+        const activity = (login, association, at, kind) => {
+            const row = person(login);
+            if (!row || !at) return;
+            if (association) row.associations.add(association);
+            if (!row.firstActivityAt || Date.parse(at) < Date.parse(row.firstActivityAt)) {
+                row.firstActivityAt = at;
+            }
+            if (!row.lastActivityAt || Date.parse(at) > Date.parse(row.lastActivityAt)) {
+                row.lastActivityAt = at;
+            }
+            row.activityMonths.add(at.slice(0, 7));
+            if (kind === "pr") row.prCount += 1;
+            if (kind === "merged_pr") row.mergedPrCount += 1;
+            if (kind === "issue") row.issueCount += 1;
+            if (kind === "comment") row.commentCount += 1;
+            if (kind === "review") row.reviewCount += 1;
+        };
+
+        for (const pr of pullRequests) {
+            activity(
+                pr.author?.login,
+                pr.authorAssociation,
+                pr.createdAt,
+                "pr",
+            );
+            const prAuthor = person(pr.author?.login);
+            if (
+                prAuthor &&
+                ["FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR"].includes(
+                    pr.authorAssociation,
+                )
+            ) {
+                prAuthor.firstTimeContributorObserved = true;
+            }
+            if (pr.mergedAt) {
+                const author = person(pr.author?.login);
+                if (author) author.mergedPrCount += 1;
+            }
+            activity(pr.editor?.login, "", pr.lastEditedAt, "edit");
+            const lastCommit = pr.commits?.nodes?.[0]?.commit;
+            activity(
+                lastCommit?.author?.user?.login,
+                "",
+                lastCommit?.committedDate,
+                "commit",
+            );
+            for (const event of interactionEvents(pr)) {
+                activity(
+                    event.login,
+                    event.association,
+                    event.at,
+                    event.type === "review" ? "review" : "comment",
+                );
+            }
+        }
+        for (const issue of issues) {
+            activity(
+                issue.author?.login,
+                issue.authorAssociation,
+                issue.createdAt,
+                "issue",
+            );
+            activity(issue.editor?.login, "", issue.lastEditedAt, "edit");
+            for (const comment of issue.comments?.nodes || []) {
+                const event = eventFrom(comment, "comment");
+                activity(event.login, event.association, event.at, "comment");
+            }
+        }
+        for (const entry of commitEntries || []) {
+            const login = entry.author?.login || "(匿名或已删除账号)";
+            const row = person(login);
+            row.commitCount += Number(entry.total) || 0;
+            for (const week of entry.weeks || []) {
+                if (week.c) {
+                    activity(
+                        login,
+                        "",
+                        new Date(week.w * 1000).toISOString(),
+                        "commit",
+                    );
+                }
+            }
+        }
+
+        const rows = [...people.values()].map((row) => {
+            const bot = isBot(row.login);
+            const internal = [...row.associations].some((association) =>
+                MAINTAINER_ASSOCIATIONS.has(association),
+            );
+            const core =
+                !bot &&
+                (internal ||
+                    row.mergedPrCount >= 5 ||
+                    row.reviewCount >= 10 ||
+                    row.commitCount >= 20);
+            return {
+                ...row,
+                associations: [...row.associations],
+                activityMonths: [...row.activityMonths].sort(),
+                activeMonths: row.activityMonths.size,
+                bot,
+                internal,
+                external: !bot && !internal,
+                firstTimeContributor: fullHistory
+                    ? row.prCount === 1
+                    : row.firstTimeContributorObserved,
+                recurringExternal:
+                    !bot &&
+                    !internal &&
+                    (row.prCount >= 2 || row.activityMonths.size >= 2),
+                core,
+                active30:
+                    Boolean(row.lastActivityAt) &&
+                    ageInDays(row.lastActivityAt) <= 30,
+                active90:
+                    Boolean(row.lastActivityAt) &&
+                    ageInDays(row.lastActivityAt) <= 90,
+                active365:
+                    Boolean(row.lastActivityAt) &&
+                    ageInDays(row.lastActivityAt) <= 365,
+            };
+        });
+        rows.sort((a, b) =>
+            String(b.lastActivityAt || "").localeCompare(
+                String(a.lastActivityAt || ""),
+            ),
+        );
+        const humanRows = rows.filter((row) => !row.bot);
+        return {
+            rows,
+            count: humanRows.length,
+            internal: humanRows.filter((row) => row.internal).length,
+            external: humanRows.filter((row) => row.external).length,
+            core: humanRows.filter((row) => row.core).length,
+            recurringExternal: humanRows.filter((row) => row.recurringExternal)
+                .length,
+            firstTime: humanRows.filter((row) => row.firstTimeContributor)
+                .length,
+            active30: humanRows.filter((row) => row.active30).length,
+            active90: humanRows.filter((row) => row.active90).length,
+            active365: humanRows.filter((row) => row.active365).length,
+        };
+    }
+
+    const summarize = summarizePullRequests;
 
     function rate(numerator, denominator) {
         return denominator
@@ -304,12 +825,15 @@
 
     function parseRepository() {
         const parts = location.pathname.split("/").filter(Boolean);
-        if (
-            parts.length < 3 ||
-            !["pull", "pulls"].includes(parts[2])
-        ) {
-            return null;
-        }
+        const repositoryTabs = new Set([
+            "pull",
+            "pulls",
+            "issues",
+            "commits",
+            "graphs",
+        ]);
+        if (parts.length < 2) return null;
+        if (parts.length > 2 && !repositoryTabs.has(parts[2])) return null;
         return { owner: parts[0], name: parts[1] };
     }
 
@@ -322,6 +846,7 @@
                     Accept: "application/vnd.github+json",
                     Authorization: `Bearer ${token}`,
                     "Content-Type": "application/json",
+                    "X-GitHub-Api-Version": "2026-03-10",
                 },
                 data: JSON.stringify({ query, variables }),
                 timeout: 30000,
@@ -370,7 +895,9 @@
         });
     }
 
-    function requestRest(token, url) {
+    function requestRest(token, url, options = {}) {
+        const acceptedStatuses = options.acceptedStatuses || [200];
+        const expectArray = options.expectArray !== false;
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: "GET",
@@ -378,21 +905,26 @@
                 headers: {
                     Accept: "application/vnd.github+json",
                     Authorization: `Bearer ${token}`,
+                    "X-GitHub-Api-Version": "2026-03-10",
                 },
                 timeout: 30000,
                 onload(response) {
-                    let payload;
-                    try {
-                        payload = JSON.parse(response.responseText);
-                    } catch (_error) {
-                        reject(new Error("GitHub REST API 返回了无法解析的数据"));
-                        return;
+                    let payload = null;
+                    if (String(response.responseText || "").trim()) {
+                        try {
+                            payload = JSON.parse(response.responseText);
+                        } catch (_error) {
+                            reject(
+                                new Error("GitHub REST API 返回了无法解析的数据"),
+                            );
+                            return;
+                        }
                     }
-                    if (response.status !== 200) {
+                    if (!acceptedStatuses.includes(response.status)) {
                         reject(
                             new Error(
                                 formatApiError(
-                                    payload.message ||
+                                    payload?.message ||
                                         `GitHub REST API 请求失败 (${response.status})`,
                                     response,
                                 ),
@@ -400,12 +932,18 @@
                         );
                         return;
                     }
-                    if (!Array.isArray(payload)) {
+                    if (
+                        response.status === 200 &&
+                        expectArray &&
+                        !Array.isArray(payload)
+                    ) {
                         reject(new Error("GitHub REST API 返回了意外的数据结构"));
                         return;
                     }
                     resolve({
-                        items: payload,
+                        data: payload,
+                        items: Array.isArray(payload) ? payload : [],
+                        status: response.status,
                         hasNextPage: /<[^>]+>;\s*rel="next"/i.test(
                             response.responseHeaders || "",
                         ),
@@ -446,9 +984,25 @@
 
     function normalizeRestComment(comment) {
         return {
+            id: String(comment.node_id || comment.id || ""),
+            url: comment.html_url || "",
             author: { login: comment.user?.login || "" },
             authorAssociation: comment.author_association,
             createdAt: comment.created_at,
+            updatedAt: comment.updated_at,
+        };
+    }
+
+    function normalizeRestReview(review) {
+        return {
+            id: String(review.node_id || review.id || ""),
+            url: review.html_url || "",
+            state: review.state,
+            author: { login: review.user?.login || "" },
+            authorAssociation: review.author_association,
+            createdAt: review.submitted_at,
+            submittedAt: review.submitted_at,
+            updatedAt: review.updated_at || null,
         };
     }
 
@@ -457,105 +1011,103 @@
         return Number.isInteger(number) ? number : null;
     }
 
-    function hasNestedOverflow(pr) {
-        return (
-            pr.comments?.pageInfo?.hasNextPage ||
-            pr.reviews?.pageInfo?.hasNextPage ||
-            pr.reviewThreads?.pageInfo?.hasNextPage ||
-            (pr.reviewThreads?.nodes || []).some(
-                (thread) => thread.comments?.pageInfo?.hasNextPage,
-            )
-        );
+    async function replaceConnectionFromRest(
+        item,
+        key,
+        url,
+        token,
+        normalize,
+        label,
+        usage,
+        rateLimits,
+        onProgress,
+    ) {
+        const nodes = [];
+        await fetchRestPages(url, token, (items, page, total, rateLimit) => {
+            usage.restRequests += 1;
+            usage.overflowRest += 1;
+            nodes.push(...items.map(normalize));
+            rateLimits.rest = rateLimit;
+            onProgress(
+                `${label}第 ${page} 页完成；累计 ${total} 条`,
+                rateLimit,
+            );
+        });
+        item[key] = {
+            totalCount: nodes.length,
+            pageInfo: { hasNextPage: false },
+            nodes,
+        };
     }
 
-    async function fetchPullRequests(
+    async function fetchCompleteInteractions(
         repository,
         token,
         selectedScope,
+        pullRequests,
+        issues,
+        usage,
+        rateLimits,
         onProgress,
     ) {
-        const pullRequests = [];
-        const overflow = new Set();
-        const rateLimits = { graphql: null, rest: null };
-        const usage = { graphqlPoints: 0, restRequests: 0 };
-        const includeThreads = selectedScope === "open";
-        let totalCount = null;
-        if (includeThreads) {
-            const countData = await requestGraphQL(
-                OPEN_COUNT_QUERY,
-                token,
-                repository,
-            );
-            if (!countData.repository) {
-                throw new Error("仓库不存在，或 Token 没有读取权限");
+        const owner = encodeURIComponent(repository.owner);
+        const name = encodeURIComponent(repository.name);
+        const base = `https://api.github.com/repos/${owner}/${name}`;
+
+        for (const pr of pullRequests) {
+            if (pr.comments?.pageInfo?.hasNextPage) {
+                await replaceConnectionFromRest(
+                    pr,
+                    "comments",
+                    `${base}/issues/${pr.number}/comments?per_page=100`,
+                    token,
+                    normalizeRestComment,
+                    `REST PR #${pr.number} 普通评论`,
+                    usage,
+                    rateLimits,
+                    onProgress,
+                );
             }
-            totalCount = countData.repository.pullRequests.totalCount;
-            const rateLimit = {
-                ...countData.rateLimit,
-                resource: "graphql",
-            };
-            usage.graphqlPoints += rateLimit.cost;
-            rateLimits.graphql = rateLimit;
-            onProgress(
-                `GraphQL Open PR 数量查询完成；共 ${totalCount} 个；cost ${rateLimit.cost}`,
-                rateLimit,
-            );
+            if (pr.reviews?.pageInfo?.hasNextPage) {
+                await replaceConnectionFromRest(
+                    pr,
+                    "reviews",
+                    `${base}/pulls/${pr.number}/reviews?per_page=100`,
+                    token,
+                    normalizeRestReview,
+                    `REST PR #${pr.number} Reviews`,
+                    usage,
+                    rateLimits,
+                    onProgress,
+                );
+            }
+        }
+        for (const issue of issues) {
+            if (issue.comments?.pageInfo?.hasNextPage) {
+                await replaceConnectionFromRest(
+                    issue,
+                    "comments",
+                    `${base}/issues/${issue.number}/comments?per_page=100`,
+                    token,
+                    normalizeRestComment,
+                    `REST Issue #${issue.number} 评论`,
+                    usage,
+                    rateLimits,
+                    onProgress,
+                );
+            }
         }
 
-        let cursor = null;
-        let hasNextPage = true;
-        let page = 0;
-        while (
-            hasNextPage &&
-            (totalCount === null || pullRequests.length < totalCount)
-        ) {
-            const pageSize =
-                totalCount === null
-                    ? 100
-                    : Math.min(100, totalCount - pullRequests.length);
-            const data = await requestGraphQL(
-                includeThreads ? OPEN_INTERACTIONS_QUERY : HISTORY_QUERY,
-                token,
-                {
-                    owner: repository.owner,
-                    name: repository.name,
-                    cursor,
-                    pageSize,
-                },
-            );
-            if (!data.repository) {
-                throw new Error("仓库不存在，或 Token 没有读取权限");
-            }
-            const connection = data.repository.pullRequests;
-            if (totalCount === null) totalCount = connection.totalCount;
-            for (const node of connection.nodes) {
-                node.reviewComments = [];
-                pullRequests.push(node);
-                if (hasNestedOverflow(node)) overflow.add(node.number);
-            }
-            cursor = connection.pageInfo.endCursor;
-            hasNextPage = connection.pageInfo.hasNextPage;
-            page += 1;
-            const rateLimit = { ...data.rateLimit, resource: "graphql" };
-            usage.graphqlPoints += rateLimit.cost;
-            rateLimits.graphql = rateLimit;
-            onProgress(
-                `GraphQL ${includeThreads ? "Open 完整互动" : "历史评论/Review"}第 ${page} 页完成；累计 ${pullRequests.length}/${totalCount} 个 PR；本页 ${pageSize} 个；cost ${rateLimit.cost}`,
-                rateLimit,
-            );
-        }
-
-        if (!includeThreads && pullRequests.length) {
+        if (selectedScope === "all") {
             const byNumber = new Map(
                 pullRequests.map((pr) => [pr.number, pr]),
             );
-            const owner = encodeURIComponent(repository.owner);
-            const name = encodeURIComponent(repository.name);
             await fetchRestPages(
-                `https://api.github.com/repos/${owner}/${name}/pulls/comments?sort=created&direction=asc&per_page=100`,
+                `${base}/pulls/comments?sort=created&direction=asc&per_page=100`,
                 token,
                 (items, page, total, rateLimit) => {
                     usage.restRequests += 1;
+                    usage.inlineCommentRest += 1;
                     for (const comment of items) {
                         const pr = byNumber.get(
                             pullNumberFromUrl(comment.pull_request_url),
@@ -568,18 +1120,224 @@
                     }
                     rateLimits.rest = rateLimit;
                     onProgress(
-                        `REST 行内 review 评论第 ${page} 页完成；累计 ${total} 条`,
+                        `REST 全仓库行内 Review 评论第 ${page} 页完成；累计 ${total} 条`,
                         rateLimit,
                     );
                 },
             );
+        } else {
+            for (const pr of pullRequests) {
+                await fetchRestPages(
+                    `${base}/pulls/${pr.number}/comments?per_page=100`,
+                    token,
+                    (items, page, total, rateLimit) => {
+                        usage.restRequests += 1;
+                        usage.inlineCommentRest += 1;
+                        pr.reviewComments.push(
+                            ...items.map(normalizeRestComment),
+                        );
+                        rateLimits.rest = rateLimit;
+                        onProgress(
+                            `REST Open PR #${pr.number} 行内评论第 ${page} 页完成；累计 ${total} 条`,
+                            rateLimit,
+                        );
+                    },
+                );
+            }
+        }
+        for (const pr of pullRequests) pr.inlineCommentsComplete = true;
+    }
+
+    async function fetchCommitContributors(
+        repository,
+        token,
+        usage,
+        rateLimits,
+        onProgress,
+    ) {
+        const owner = encodeURIComponent(repository.owner);
+        const name = encodeURIComponent(repository.name);
+        const result = await requestRest(
+            token,
+            `https://api.github.com/repos/${owner}/${name}/stats/contributors`,
+            {
+                acceptedStatuses: [200, 202, 204],
+                expectArray: false,
+            },
+        );
+        usage.restRequests += 1;
+        usage.commitStatsRest += 1;
+        rateLimits.rest = result.rateLimit;
+        const message =
+            result.status === 200
+                ? `REST Commit 贡献者统计完成；${result.items.length} 位作者`
+                : result.status === 202
+                  ? "GitHub 正在生成 Commit 统计缓存；本次不自动重试以节省额度"
+                  : "仓库没有可用的 Commit 统计";
+        onProgress(message, result.rateLimit);
+        return {
+            entries: result.status === 200 ? result.items : null,
+            status: result.status,
+        };
+    }
+
+    function collectOverflow(pullRequests, issues) {
+        const rows = [];
+        for (const pr of pullRequests) {
+            const fields = [];
+            if (pr.comments?.pageInfo?.hasNextPage) fields.push("普通评论");
+            if (pr.reviews?.pageInfo?.hasNextPage) fields.push("Reviews");
+            if (pr.timelineItems?.pageInfo?.hasNextPage) fields.push("Draft 时间线");
+            if (fields.length) rows.push(`PR #${pr.number} ${fields.join("/")}`);
+        }
+        for (const issue of issues) {
+            const fields = [];
+            if (issue.comments?.pageInfo?.hasNextPage) fields.push("评论");
+            if (issue.labels?.pageInfo?.hasNextPage) fields.push("标签");
+            if (fields.length) {
+                rows.push(`Issue #${issue.number} ${fields.join("/")}`);
+            }
+        }
+        return rows;
+    }
+
+    async function fetchPullRequests(
+        repository,
+        token,
+        selectedScope,
+        onProgress,
+        requestedOptions = DEFAULT_OPTIONS,
+    ) {
+        const selectedOptions = { ...DEFAULT_OPTIONS, ...requestedOptions };
+        const pullRequests = [];
+        const issues = [];
+        const rateLimits = { graphql: null, rest: null };
+        const usage = {
+            graphqlPoints: 0,
+            graphqlRequests: 0,
+            restRequests: 0,
+            overflowRest: 0,
+            inlineCommentRest: 0,
+            commitStatsRest: 0,
+        };
+        let prCursor = null;
+        let issueCursor = null;
+        let fetchPulls = true;
+        let fetchIssues = selectedOptions.includeIssues;
+        let prTotal = null;
+        let issueTotal = selectedOptions.includeIssues ? null : 0;
+        let page = 0;
+
+        while (fetchPulls || fetchIssues) {
+            const data = await requestGraphQL(REPOSITORY_QUERY, token, {
+                owner: repository.owner,
+                name: repository.name,
+                prCursor,
+                issueCursor,
+                prStates:
+                    selectedScope === "open"
+                        ? ["OPEN"]
+                        : ["OPEN", "CLOSED", "MERGED"],
+                issueStates:
+                    selectedScope === "open" ? ["OPEN"] : ["OPEN", "CLOSED"],
+                fetchPulls,
+                fetchIssues,
+                includeDraftHistory: selectedOptions.includeDraftHistory,
+            });
+            if (!data.repository) {
+                throw new Error("仓库不存在，或 Token 没有读取权限");
+            }
+            if (fetchPulls) {
+                const connection = data.repository.pullRequests;
+                prTotal ??= connection.totalCount;
+                for (const node of connection.nodes) {
+                    node.reviewComments = [];
+                    node.inlineCommentsComplete = false;
+                    pullRequests.push(node);
+                }
+                prCursor = connection.pageInfo.endCursor;
+                fetchPulls = connection.pageInfo.hasNextPage;
+            }
+            if (fetchIssues) {
+                const connection = data.repository.issues;
+                issueTotal ??= connection.totalCount;
+                issues.push(...connection.nodes);
+                issueCursor = connection.pageInfo.endCursor;
+                fetchIssues = connection.pageInfo.hasNextPage;
+            }
+            page += 1;
+            const rateLimit = { ...data.rateLimit, resource: "graphql" };
+            usage.graphqlPoints += rateLimit.cost;
+            usage.graphqlRequests += 1;
+            rateLimits.graphql = rateLimit;
+            onProgress(
+                `GraphQL 主查询第 ${page} 页完成；PR ${pullRequests.length}/${prTotal ?? "?"}` +
+                    (selectedOptions.includeIssues
+                        ? `，Issue ${issues.length}/${issueTotal ?? "?"}`
+                        : "") +
+                    `；cost ${rateLimit.cost}`,
+                rateLimit,
+            );
         }
 
-        // ponytail: only repository-wide inline comments use REST. Ordinary
-        // comments/reviews stay capped at 100 per PR and Open threads at 40.
+        if (selectedOptions.completeInteractions) {
+            await fetchCompleteInteractions(
+                repository,
+                token,
+                selectedScope,
+                pullRequests,
+                issues,
+                usage,
+                rateLimits,
+                onProgress,
+            );
+        }
+
+        let commitResult = { entries: null, status: null };
+        if (selectedOptions.includeCommits) {
+            commitResult = await fetchCommitContributors(
+                repository,
+                token,
+                usage,
+                rateLimits,
+                onProgress,
+            );
+        }
+
+        const commitStats = analyzeCommitContributors(commitResult.entries);
+        const contributorStats = buildContributorStatistics(
+            pullRequests,
+            issues,
+            commitResult.entries,
+            selectedScope === "all",
+        );
+
+        // ponytail: exact inline comments are opt-in because Open scope costs at
+        // least one REST request per PR; exact per-commit history is intentionally
+        // replaced by GitHub's single cached contributor-statistics endpoint.
         return {
-            rows: pullRequests.map(analyzePullRequest),
-            overflow: [...overflow].sort((a, b) => a - b),
+            rows: pullRequests.map((pr) => analyzePullRequest(pr)),
+            issueRows: issues.map((issue) => analyzeIssue(issue)),
+            contributors: contributorStats,
+            commitStats,
+            overflow: collectOverflow(pullRequests, issues),
+            coverage: {
+                fullHistory: selectedScope === "all",
+                issues: selectedOptions.includeIssues,
+                draftHistory: selectedOptions.includeDraftHistory,
+                completeInteractions: selectedOptions.completeInteractions,
+                inlineComments: selectedOptions.completeInteractions,
+                commitStatus: commitResult.status,
+            },
+            raw: {
+                repository,
+                scope: selectedScope,
+                options: selectedOptions,
+                fetchedAt: new Date().toISOString(),
+                pullRequests,
+                issues,
+                commitContributors: commitResult.entries,
+            },
             rateLimits,
             usage,
         };
@@ -600,6 +1358,7 @@
     }
 
     function formatDate(isoDate) {
+        if (!isoDate || !Number.isFinite(Date.parse(isoDate))) return "—";
         return new Intl.DateTimeFormat("zh-CN", {
             year: "numeric",
             month: "2-digit",
@@ -612,6 +1371,7 @@
     }
 
     function relativeTime(isoDate) {
+        if (!isoDate || !Number.isFinite(Date.parse(isoDate))) return "—";
         const seconds = Math.max(
             0,
             Math.floor((Date.now() - Date.parse(isoDate)) / 1000),
@@ -636,6 +1396,119 @@
         return `${count} / ${total}（${rate(count, total)}）`;
     }
 
+    function formatDuration(hours) {
+        if (!Number.isFinite(hours)) return "—";
+        if (hours < 1) return `${Math.round(hours * 60)} 分钟`;
+        if (hours < 48) return `${hours.toFixed(1)} 小时`;
+        return `${(hours / 24).toFixed(1)} 天`;
+    }
+
+    function cardsMarkup(cards) {
+        return cards
+            .map(
+                ([label, value, className = ""]) => `
+                    <article class="card ${className}">
+                      <span>${escapeHtml(label)}</span>
+                      <strong>${value}</strong>
+                    </article>
+                `,
+            )
+            .join("");
+    }
+
+    function contributorRole(row) {
+        if (row.bot) return "机器人";
+        const roles = [];
+        if (row.core) roles.push("核心");
+        if (row.internal) roles.push("内部");
+        if (row.firstTimeContributor) roles.push("首次");
+        if (row.recurringExternal) roles.push("持续外部");
+        else if (row.external) roles.push("外部");
+        return roles.join(" / ") || "其他";
+    }
+
+    function renderCostGuide() {
+        const prCount = analysis?.rows.length || 0;
+        const issueCount = analysis?.issueRows.length || 0;
+        const usage = analysis?.usage || lastUsage;
+        const costOptions = selectedOptions();
+        const draftEstimate = Math.max(1, Math.ceil(prCount / 100));
+        const rows = [
+            [
+                "PR 标题/正文/作者/状态/时间/改动量/当前 Draft/stale",
+                "主 GraphQL 标量字段",
+                "否",
+                "0 额外 point",
+                "低",
+            ],
+            [
+                "PR 普通评论、修改时间、Reviews、PR commit 数",
+                "主 GraphQL 嵌套连接",
+                "否",
+                "约 3 points / 100 PR；与主查询合并",
+                "中",
+            ],
+            [
+                "曾经 Draft",
+                "PR Draft 时间线",
+                "可选",
+                `约 +${draftEstimate} GraphQL points；当前${costOptions.includeDraftHistory ? "已启用" : "未启用"}`,
+                "低-中",
+            ],
+            [
+                "行内 Review 评论",
+                "REST /pulls/comments 或逐 Open PR",
+                "是",
+                `实际 ${usage.inlineCommentRest || 0} 请求；Open 完整模式至少 1 请求/PR`,
+                "高/可变",
+            ],
+            [
+                "超过 100 条的评论或 Review",
+                "仅对溢出对象 REST 分页",
+                "是",
+                `实际 ${usage.overflowRest || 0} 请求；每 100 条 1 请求`,
+                "可变",
+            ],
+            [
+                "Issue 基础字段、标签、关闭 PR、前 100 条评论",
+                "与 PR 主 GraphQL 合并",
+                "模块可选",
+                `约 3 points / 100 Issue；本次 ${issueCount} 个`,
+                "中",
+            ],
+            [
+                "贡献者最近活跃、PR/评论/Review 数和身份",
+                "从已采集事件聚合",
+                "否",
+                "0 请求；完整度取决于范围与互动开关",
+                "低",
+            ],
+            [
+                "Commit 时间与作者分布",
+                "REST /stats/contributors",
+                "是",
+                `实际 ${usage.commitStatsRest || 0} 请求`,
+                "低",
+            ],
+            [
+                "逐条 Commit 的精确时间、匿名作者和 merge commit",
+                "未启用：需完整 Commit 分页",
+                "是",
+                "约 1 REST 请求 / 100 commits",
+                "很高",
+            ],
+        ];
+        ui.costTable.innerHTML = `
+            <thead><tr><th>信息</th><th>来源</th><th>额外查询</th><th>成本</th><th>评价</th></tr></thead>
+            <tbody>${rows
+                .map(
+                    (row) =>
+                        `<tr>${row.map((cell) => `<td>${escapeHtml(cell)}</td>`).join("")}</tr>`,
+                )
+                .join("")}</tbody>
+        `;
+    }
+
     function statRows(summary) {
         return [
             ["中文", summary.chinese],
@@ -645,8 +1518,8 @@
     }
 
     function render() {
-        if (!analyzedRows) return;
-        const summary = summarize(analyzedRows, scope);
+        if (!analysis) return;
+        const summary = summarizePullRequests(analysis.rows, scope);
         const isOpen = scope === "open";
         const total = summary.total.count;
         const cards = isOpen
@@ -674,6 +1547,9 @@
                           summary.english.count,
                       ),
                   ],
+                  ["30 天 stale", countAndRate(summary.total.stale30, total)],
+                  ["90 天 stale", countAndRate(summary.total.stale90, total)],
+                  ["当前 Draft", countAndRate(summary.total.currentDraft, total)],
                   [
                       "维护者最近回复",
                       latestReplyHtml(summary.total.latestMaintainerReply, true),
@@ -707,22 +1583,28 @@
                       rate(summary.total.maintainerReplied, total),
                   ],
                   [
+                      "首次维护者回复中位数",
+                      formatDuration(
+                          summary.total.medianFirstMaintainerResponseHours,
+                      ),
+                  ],
+                  [
+                      "曾为 Draft",
+                      analyzedOptions?.includeDraftHistory
+                          ? countAndRate(
+                                summary.total.everDraft,
+                                summary.total.draftKnown,
+                            )
+                          : `未启用历史（当前 ${summary.total.currentDraft}）`,
+                  ],
+                  [
                       "维护者最近回复",
                       latestReplyHtml(summary.total.latestMaintainerReply, true),
                       "latest",
                   ],
               ];
 
-        ui.cards.innerHTML = cards
-            .map(
-                ([label, value, className = ""]) => `
-                    <article class="card ${className}">
-                      <span>${escapeHtml(label)}</span>
-                      <strong>${value}</strong>
-                    </article>
-                `,
-            )
-            .join("");
+        ui.cards.innerHTML = cardsMarkup(cards);
 
         const mergeHeader = isOpen
             ? ""
@@ -735,6 +1617,8 @@
                 ${mergeHeader}
                 <th>提交者回复率</th>
                 <th>维护者回复率</th>
+                <th>30 天 stale</th>
+                <th>首次维护者回复中位数</th>
                 <th>维护者最近回复时间</th>
               </tr>
             </thead>
@@ -762,6 +1646,13 @@
                               stats.maintainerReplied,
                               denominator,
                           )}）</td>
+                          <td>${stats.stale30} / ${denominator}（${rate(
+                              stats.stale30,
+                              denominator,
+                          )}）</td>
+                          <td>${formatDuration(
+                              stats.medianFirstMaintainerResponseHours,
+                          )}</td>
                           <td class="reply">${latestReplyHtml(
                               stats.latestMaintainerReply,
                           )}</td>
@@ -772,14 +1663,138 @@
             </tbody>
         `;
 
-        const warning = overflowPrs.length
-            ? `；PR #${overflowPrs.join(", #")} 的讨论数据超过单次检索上限，回复统计为下限`
-            : "";
+        ui.issueSection.hidden = !analysis.coverage.issues;
+        if (analysis.coverage.issues) {
+            const issues = summarizeIssues(analysis.issueRows, scope);
+            ui.issueCards.innerHTML = cardsMarkup([
+                [isOpen ? "Open Issue" : "Issue", issues.count],
+                ["维护者回复率", rate(issues.maintainerReplied, issues.count)],
+                ["无人回复率", rate(issues.noResponse, issues.count)],
+                ["30 天 stale", countAndRate(issues.stale30, issues.count)],
+                ["首次回复中位数", formatDuration(issues.medianFirstResponseHours)],
+                [
+                    "首次维护者回复中位数",
+                    formatDuration(issues.medianFirstMaintainerResponseHours),
+                ],
+                ["解决时间中位数", formatDuration(issues.medianResolutionHours)],
+                ["由 PR 关闭", countAndRate(issues.closedByPr, issues.closed)],
+                [
+                    "维护者最近回复",
+                    latestReplyHtml(issues.latestMaintainerReply, true),
+                    "latest",
+                ],
+            ]);
+            ui.issueTable.innerHTML = `
+                <thead><tr><th>Bug</th><th>Feature</th><th>Docs</th><th>Good first issue</th><th>Help wanted</th></tr></thead>
+                <tbody><tr>
+                  <td>${issues.categories.bug}</td>
+                  <td>${issues.categories.feature}</td>
+                  <td>${issues.categories.docs}</td>
+                  <td>${issues.categories.goodFirst}</td>
+                  <td>${issues.categories.helpWanted}</td>
+                </tr></tbody>
+            `;
+        }
+
+        const contributorSummary = analysis.contributors;
+        ui.contributorCards.innerHTML = cardsMarkup([
+            ["贡献者", contributorSummary.count],
+            ["近 30 天活跃", contributorSummary.active30],
+            ["近 90 天活跃", contributorSummary.active90],
+            ["外部贡献者", contributorSummary.external],
+            ["持续外部贡献者", contributorSummary.recurringExternal],
+            ["内部成员", contributorSummary.internal],
+            ["核心贡献者", contributorSummary.core],
+            [
+                analysis.coverage.fullHistory
+                    ? "首次贡献者"
+                    : "Open 中首次贡献者",
+                contributorSummary.firstTime,
+            ],
+        ]);
+        ui.contributorTable.innerHTML = `
+            <thead><tr><th>贡献者</th><th>最近活跃</th><th>角色</th><th>PR / 合并</th><th>Issue</th><th>评论</th><th>Review</th><th>Commit</th></tr></thead>
+            <tbody>${contributorSummary.rows
+                .slice(0, 25)
+                .map(
+                    (row) => `<tr>
+                      <td>${escapeHtml(row.login)}</td>
+                      <td>${formatDate(row.lastActivityAt)}</td>
+                      <td>${escapeHtml(contributorRole(row))}</td>
+                      <td>${row.prCount} / ${row.mergedPrCount}</td>
+                      <td>${row.issueCount}</td>
+                      <td>${row.commentCount}</td>
+                      <td>${row.reviewCount}</td>
+                      <td>${row.commitCount}</td>
+                    </tr>`,
+                )
+                .join("")}</tbody>
+        `;
+
+        ui.commitSection.hidden = !analyzedOptions?.includeCommits;
+        if (analyzedOptions?.includeCommits) {
+            const commits = analysis.commitStats;
+            if (commits) {
+                ui.commitCards.innerHTML = cardsMarkup([
+                    ["统计作者 Commit", commits.totalCommits],
+                    ["作者数", commits.contributorCount],
+                    ["Top 1 占比", rate(commits.authors[0]?.total || 0, commits.totalCommits)],
+                    ["Top 3 占比", `${(commits.top3Share * 100).toFixed(2)}%`],
+                    ["Top 5 占比", `${(commits.top5Share * 100).toFixed(2)}%`],
+                    ["最近活跃周", formatDate(commits.lastActiveWeek)],
+                    [
+                        "最近月份分布",
+                        commits.monthly
+                            .map(([month, count]) => `${month}: ${count}`)
+                            .join(" · ") || "—",
+                        "wide",
+                    ],
+                ]);
+                ui.commitTable.innerHTML = `
+                    <thead><tr><th>作者</th><th>Commit</th><th>占比</th></tr></thead>
+                    <tbody>${commits.authors
+                        .slice(0, 20)
+                        .map(
+                            (row) => `<tr><td>${escapeHtml(row.login)}</td><td>${row.total}</td><td>${rate(row.total, commits.totalCommits)}</td></tr>`,
+                        )
+                        .join("")}</tbody>
+                `;
+            } else {
+                ui.commitCards.innerHTML = cardsMarkup([
+                    [
+                        "Commit 统计",
+                        analysis.coverage.commitStatus === 202
+                            ? "GitHub 正在生成缓存，请稍后重新分析"
+                            : "无可用数据",
+                        "wide",
+                    ],
+                ]);
+                ui.commitTable.innerHTML = "";
+            }
+        }
+
+        renderCostGuide();
+        ui.export.disabled = false;
+
+        const warnings = [];
+        if (!analysis.coverage.inlineComments) {
+            warnings.push("未取行内 Review 评论，回复率可能是下限");
+        }
+        if (overflowItems.length) {
+            warnings.push(`${overflowItems.slice(0, 8).join("、")} 数据溢出`);
+        }
+        if (!analysis.coverage.fullHistory) {
+            warnings.push("贡献者活动计数只覆盖 Open 对象；首次身份使用 GitHub 关联字段");
+        }
+        if (!analysis.coverage.draftHistory) {
+            warnings.push("非当前 Draft 的历史状态未知");
+        }
+        const warning = warnings.length ? `；覆盖说明：${warnings.join("；")}` : "";
         const quotas = formatRateLimits();
         const rateLimit = quotas ? `；${quotas}` : "";
-        const usage = `；本次消耗 GraphQL ${lastUsage.graphqlPoints} points，REST ${lastUsage.restRequests} 次请求`;
+        const usage = `；本次消耗 GraphQL ${lastUsage.graphqlPoints} points / ${lastUsage.graphqlRequests} 次请求，REST ${lastUsage.restRequests} 次请求`;
         setStatus(
-            `已分析 ${analyzedRows.length} 个 PR；当前显示 ${total} 个${warning}${usage}${rateLimit}`,
+            `已分析 ${analysis.rows.length} 个 PR、${analysis.issueRows.length} 个 Issue；当前显示 ${total} 个 PR${warning}${usage}${rateLimit}`,
             "success",
         );
     }
@@ -799,7 +1814,47 @@
         ui.analyze.disabled = value;
         ui.scopeAll.disabled = value;
         ui.scopeOpen.disabled = value;
+        ui.includeIssues.disabled = value;
+        ui.includeCommits.disabled = value;
+        ui.includeDraftHistory.disabled = value;
+        ui.completeInteractions.disabled = value;
+        ui.export.disabled = value || !analysis;
         ui.analyze.textContent = value ? "分析中…" : "重新分析";
+    }
+
+    function selectedOptions() {
+        return {
+            includeIssues: ui.includeIssues.checked,
+            includeCommits: ui.includeCommits.checked,
+            includeDraftHistory: ui.includeDraftHistory.checked,
+            completeInteractions: ui.completeInteractions.checked,
+        };
+    }
+
+    function saveOptions() {
+        GM_setValue(OPTIONS_KEY, selectedOptions());
+        if (analysis) {
+            setStatus("分析选项已改变；点击“重新分析”后生效");
+        }
+        renderCostGuide();
+    }
+
+    function resetOutput() {
+        for (const element of [
+            ui.cards,
+            ui.table,
+            ui.issueCards,
+            ui.issueTable,
+            ui.contributorCards,
+            ui.contributorTable,
+            ui.commitCards,
+            ui.commitTable,
+        ]) {
+            element.innerHTML = "";
+        }
+        ui.issueSection.hidden = true;
+        ui.commitSection.hidden = true;
+        ui.export.disabled = true;
     }
 
     async function runAnalysis() {
@@ -812,18 +1867,30 @@
         }
 
         const requestedScope = scope;
-        const strategy =
-            requestedScope === "open"
-                ? "GraphQL 动态页大小完整互动"
-                : "低成本 GraphQL 历史 + REST 行内评论";
+        const requestedOptions = selectedOptions();
+        const strategy = `合并 PR/Issue GraphQL 分页 + 单次 Commit 统计${
+            requestedOptions.completeInteractions
+                ? " + 完整互动 REST"
+                : "（不扫描行内评论）"
+        }`;
         lastRateLimits = { graphql: null, rest: null };
-        lastUsage = { graphqlPoints: 0, restRequests: 0 };
+        lastUsage = {
+            graphqlPoints: 0,
+            graphqlRequests: 0,
+            restRequests: 0,
+            overflowRest: 0,
+            inlineCommentRest: 0,
+            commitStatsRest: 0,
+        };
+        analysis = null;
+        analyzedScope = null;
+        analyzedOptions = null;
+        overflowItems = [];
         setLoading(true);
-        ui.cards.innerHTML = "";
-        ui.table.innerHTML = "";
+        resetOutput();
         setStatus(
             `开始分析 ${currentRepository.owner}/${currentRepository.name}；范围：${
-                requestedScope === "open" ? "仅 Open" : "全部 PR"
+                requestedScope === "open" ? "仅 Open" : "全部历史"
             }；低额度策略：${strategy}`,
         );
         try {
@@ -841,10 +1908,12 @@
                         }`,
                     );
                 },
+                requestedOptions,
             );
-            analyzedRows = result.rows;
+            analysis = result;
             analyzedScope = requestedScope;
-            overflowPrs = result.overflow;
+            analyzedOptions = requestedOptions;
+            overflowItems = result.overflow;
             lastRateLimits = result.rateLimits;
             lastUsage = result.usage;
             render();
@@ -853,6 +1922,31 @@
         } finally {
             setLoading(false);
         }
+    }
+
+    function exportAnalysis() {
+        if (!analysis) return;
+        const payload = {
+            ...analysis.raw,
+            coverage: analysis.coverage,
+            usage: analysis.usage,
+            derived: {
+                pullRequests: analysis.rows,
+                issues: analysis.issueRows,
+                contributors: analysis.contributors,
+                commits: analysis.commitStats,
+            },
+        };
+        const blob = new Blob([JSON.stringify(payload, null, 2)], {
+            type: "application/json;charset=utf-8",
+        });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `${currentRepository.owner}-${currentRepository.name}-github-statistics.json`;
+        link.click();
+        URL.revokeObjectURL(url);
+        setStatus("统计原始数据与派生指标已导出为 JSON", "success");
     }
 
     function saveToken() {
@@ -921,7 +2015,7 @@
               right: 22px;
               bottom: 70px;
               z-index: 2147483647;
-              width: min(900px, calc(100vw - 44px));
+              width: min(1120px, calc(100vw - 44px));
               max-height: calc(100vh - 100px);
               overflow: auto;
               color: var(--text);
@@ -955,6 +2049,8 @@
             #close { border: 0; background: transparent; font-size: 20px; cursor: pointer; color: var(--muted); }
             main { padding: 14px 16px 18px; }
             .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+            .options { display: flex; gap: 8px 14px; flex-wrap: wrap; margin: 10px 0; padding: 9px 10px; background: var(--muted-bg); border-radius: 8px; }
+            .options label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
             .scope { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
             .scope button { padding: 6px 11px; border: 0; border-right: 1px solid var(--border); background: var(--panel-bg); color: var(--text); cursor: pointer; }
             .scope button:last-child { border-right: 0; }
@@ -963,13 +2059,17 @@
             #status[data-type="error"] { color: #cf222e; }
             #status[data-type="success"] { color: #1a7f37; }
             #log { max-height: 160px; overflow: auto; margin: 8px 0 0; padding: 8px; color: var(--text); background: var(--muted-bg); border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
-            #cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 8px; margin: 12px 0; }
+            .section { margin-top: 18px; }
+            .section h3 { margin: 0 0 8px; font-size: 15px; }
+            .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 8px; margin: 10px 0; }
             .card { min-width: 0; padding: 10px; background: var(--muted-bg); border: 1px solid var(--border); border-radius: 8px; }
             .card span { display: block; color: var(--muted); margin-bottom: 4px; }
             .card strong { display: block; font-size: 17px; overflow-wrap: anywhere; }
             .card.latest { grid-column: span 2; }
             .card.latest strong { font-size: 13px; }
             .card.latest strong span { margin-top: 3px; }
+            .card.wide { grid-column: 1 / -1; }
+            .card.wide strong { font-size: 13px; line-height: 1.55; }
             .table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
             table { width: 100%; border-collapse: collapse; white-space: nowrap; }
             th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
@@ -991,23 +2091,52 @@
               .card.latest { grid-column: span 1; }
             }
           </style>
-          <button id="launcher" aria-controls="panel" aria-expanded="false" hidden>PR 统计</button>
-          <section id="panel" hidden aria-label="GitHub PR 统计">
+          <button id="launcher" aria-controls="panel" aria-expanded="false" hidden>仓库统计</button>
+          <section id="panel" hidden aria-label="GitHub 仓库统计">
             <header>
-              <h2 id="title">GitHub PR 统计</h2>
+              <h2 id="title">GitHub 仓库统计</h2>
               <button id="close" title="关闭" aria-label="关闭">×</button>
             </header>
             <main>
               <div class="toolbar">
                 <div class="scope" aria-label="统计范围">
-                  <button id="scope-all">全部 PR</button>
+                  <button id="scope-all">全部历史</button>
                   <button id="scope-open" class="active">仅 Open</button>
                 </div>
                 <button id="analyze" class="button primary">开始分析</button>
+                <button id="export" class="button" disabled>导出 JSON</button>
+              </div>
+              <div class="options" aria-label="分析模块">
+                <label><input id="include-issues" type="checkbox" checked>Issue 统计</label>
+                <label><input id="include-commits" type="checkbox" checked>Commit 概览（1 REST）</label>
+                <label title="读取 Draft/Ready 时间线，约增加 1 GraphQL point/100 PR"><input id="include-draft-history" type="checkbox">曾经 Draft</label>
+                <label title="Open 模式至少每个 PR 一次 REST；全部历史按每 100 条行内评论一次 REST"><input id="complete-interactions" type="checkbox">完整互动（高成本）</label>
               </div>
               <p id="status">尚未分析</p>
-              <div id="cards"></div>
-              <div class="table-wrap"><table id="table"></table></div>
+              <section class="section">
+                <h3>Pull Request</h3>
+                <div id="cards" class="cards"></div>
+                <div class="table-wrap"><table id="table"></table></div>
+              </section>
+              <section id="issue-section" class="section" hidden>
+                <h3>Issue</h3>
+                <div id="issue-cards" class="cards"></div>
+                <div class="table-wrap"><table id="issue-table"></table></div>
+              </section>
+              <section class="section">
+                <h3>贡献者（最近活跃优先，最多显示 25 人）</h3>
+                <div id="contributor-cards" class="cards"></div>
+                <div class="table-wrap"><table id="contributor-table"></table></div>
+              </section>
+              <section id="commit-section" class="section" hidden>
+                <h3>Commit</h3>
+                <div id="commit-cards" class="cards"></div>
+                <div class="table-wrap"><table id="commit-table"></table></div>
+              </section>
+              <details open>
+                <summary>信息来源与 API 成本</summary>
+                <div class="table-wrap"><table id="cost-table"></table></div>
+              </details>
               <details open>
                 <summary>分析日志</summary>
                 <pre id="log" role="log" aria-live="polite"></pre>
@@ -1020,12 +2149,14 @@
                   <button id="clear-token" class="button">清除 Token</button>
                 </div>
                 <p class="help">
-                  GitHub REST/GraphQL API 使用同一个 Token。建议使用仅含仓库元数据和 Pull requests 只读权限的 fine-grained token。
+                  GitHub REST/GraphQL API 使用同一个 Token。私有仓库需要仓库元数据、Pull requests、Issues 与 Contents 只读权限。
                   Token 只保存在油猴扩展存储中，不会写入页面或仓库。
                 </p>
               </details>
               <p class="help">
-                中文判定：标题或原始正文任一处含中文。回复包含普通评论、review 和行内 review 回复；维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
+                中文判定：标题或原始正文任一处含中文。默认回复统计包含普通评论和 Review；行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
+                stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
+                核心贡献者默认指内部成员，或达到 5 个合并 PR、10 次 Review、20 个 Commit 任一阈值。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
               </p>
             </main>
           </section>
@@ -1040,12 +2171,26 @@
             title: get("#title"),
             close: get("#close"),
             analyze: get("#analyze"),
+            export: get("#export"),
             scopeAll: get("#scope-all"),
             scopeOpen: get("#scope-open"),
+            includeIssues: get("#include-issues"),
+            includeCommits: get("#include-commits"),
+            includeDraftHistory: get("#include-draft-history"),
+            completeInteractions: get("#complete-interactions"),
             status: get("#status"),
             log: get("#log"),
             cards: get("#cards"),
             table: get("#table"),
+            issueSection: get("#issue-section"),
+            issueCards: get("#issue-cards"),
+            issueTable: get("#issue-table"),
+            contributorCards: get("#contributor-cards"),
+            contributorTable: get("#contributor-table"),
+            commitSection: get("#commit-section"),
+            commitCards: get("#commit-cards"),
+            commitTable: get("#commit-table"),
+            costTable: get("#cost-table"),
             settings: get("#settings"),
             tokenState: get("#token-state"),
             token: get("#token"),
@@ -1053,27 +2198,45 @@
             clearToken: get("#clear-token"),
         };
 
+        const storedOptions = GM_getValue(OPTIONS_KEY, DEFAULT_OPTIONS);
+        for (const [key, fallback] of Object.entries(DEFAULT_OPTIONS)) {
+            ui[key].checked =
+                typeof storedOptions?.[key] === "boolean"
+                    ? storedOptions[key]
+                    : fallback;
+        }
+
         ui.launcher.addEventListener("click", () => {
             ui.panel.hidden = !ui.panel.hidden;
             ui.launcher.setAttribute(
                 "aria-expanded",
                 String(!ui.panel.hidden),
             );
-            if (!ui.panel.hidden && !analyzedRows) runAnalysis();
+            if (!ui.panel.hidden && !analysis) runAnalysis();
         });
         ui.close.addEventListener("click", () => {
             ui.panel.hidden = true;
             ui.launcher.setAttribute("aria-expanded", "false");
         });
         ui.analyze.addEventListener("click", runAnalysis);
+        ui.export.addEventListener("click", exportAnalysis);
         ui.scopeAll.addEventListener("click", () => setScope("all"));
         ui.scopeOpen.addEventListener("click", () => setScope("open"));
         ui.saveToken.addEventListener("click", saveToken);
         ui.clearToken.addEventListener("click", clearToken);
+        for (const input of [
+            ui.includeIssues,
+            ui.includeCommits,
+            ui.includeDraftHistory,
+            ui.completeInteractions,
+        ]) {
+            input.addEventListener("change", saveOptions);
+        }
         ui.token.addEventListener("keydown", (event) => {
             if (event.key === "Enter") saveToken();
         });
         updateTokenState();
+        renderCostGuide();
     }
 
     function setScope(value) {
@@ -1082,7 +2245,7 @@
         ui.scopeAll.classList.toggle("active", value === "all");
         ui.scopeOpen.classList.toggle("active", value === "open");
         if (
-            analyzedRows &&
+            analysis &&
             (analyzedScope === "all" || analyzedScope === value)
         ) {
             render();
@@ -1105,16 +2268,24 @@
             repository.owner !== currentRepository.owner ||
             repository.name !== currentRepository.name;
         currentRepository = repository;
-        ui.title.textContent = `${repository.owner}/${repository.name} PR 统计`;
+        ui.title.textContent = `${repository.owner}/${repository.name} 仓库统计`;
         if (changed) {
-            analyzedRows = null;
+            analysis = null;
             analyzedScope = null;
-            overflowPrs = [];
+            analyzedOptions = null;
+            overflowItems = [];
             lastRateLimits = { graphql: null, rest: null };
-            lastUsage = { graphqlPoints: 0, restRequests: 0 };
+            lastUsage = {
+                graphqlPoints: 0,
+                graphqlRequests: 0,
+                restRequests: 0,
+                overflowRest: 0,
+                inlineCommentRest: 0,
+                commitStatsRest: 0,
+            };
             ui.log.textContent = "";
-            ui.cards.innerHTML = "";
-            ui.table.innerHTML = "";
+            resetOutput();
+            renderCostGuide();
             setStatus("尚未分析");
         }
     }
@@ -1122,14 +2293,20 @@
     if (typeof module === "object" && module.exports) {
         module.exports = {
             analyzePullRequest,
+            analyzeIssue,
+            analyzeCommitContributors,
+            buildContributorStatistics,
             classifyLanguage,
             fetchPullRequests,
             formatRateLimit,
             normalizeRestComment,
+            normalizeRestReview,
             pullNumberFromUrl,
             rate,
             rateLimitFromHeaders,
             summarize,
+            summarizeIssues,
+            summarizePullRequests,
         };
         return;
     }
