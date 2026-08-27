@@ -171,6 +171,7 @@ class LabelListWidget(QtWidgets.QListView):
 
     def __init__(self):
         super().__init__()
+        self.setObjectName("LabelList")
         self._selected_items = []
         self._ignore_mouse_move_selection = False
         self._preserved_selected_items = []

@@ -71,6 +71,24 @@ class TestLabelWidgetMetrics(unittest.TestCase):
         _set_label_list_item_lock(item, False)
         self.assertFalse(item.is_locked())
 
+    def test_label_list_selection_uses_contrast_gradient(self):
+        from anylabeling.views.labeling.utils.style import get_dock_style
+        from anylabeling.views.labeling.utils.theme import init_theme
+        from anylabeling.views.labeling.widgets import LabelListWidget
+
+        init_theme("light")
+        widget = LabelListWidget()
+        stylesheet = get_dock_style()
+        label_list_style = stylesheet.split(
+            "QListView#LabelList", maxsplit=1
+        )[1].split("}", maxsplit=1)[0]
+
+        self.assertEqual(widget.objectName(), "LabelList")
+        self.assertIn(
+            "selection-background-color: qlineargradient", label_list_style
+        )
+        self.assertIn("selection-color: #1d1d1f", label_list_style)
+
     def test_right_double_click_does_not_emit_item_double_clicked(self):
         from anylabeling.views.labeling.widgets import (
             LabelListWidget,
