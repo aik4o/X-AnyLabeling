@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.17
+// @version      0.6.18
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.17";
+    const SCRIPT_VERSION = "0.6.18";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -1648,6 +1648,7 @@
             const requestLabel = requestParts.join(" + ");
             let data;
             let requestSeconds;
+            let retryCount = 0;
             while (true) {
                 stopIfPaused();
                 onProgress(
@@ -1679,7 +1680,6 @@
                     ).toFixed(1);
                     break;
                 } catch (error) {
-                    saveCheckpoint();
                     const seconds = (
                         (Date.now() - requestStartedAt) /
                         1000
@@ -1690,75 +1690,25 @@
                         pageSize - PAGE_SIZE_STEP,
                     );
                     const retryable = isRetryableGraphqlFailure(error);
-                    if (!retryable || nextPageSize === pageSize) {
-                        const reason =
-                            retryable
-                                ? `已到最小对象上限 ${pageSize}/页`
-                                : "该错误不是可降级重试的临时 GraphQL 错误";
+                    if (!retryable) {
+                        saveCheckpoint();
                         throw new Error(
-                            `${failure}；未自动重试：${reason}；${error.message || String(error)}`,
+                            `${failure}；未自动重试：该错误不是可降级重试的临时 GraphQL 错误；${error.message || String(error)}`,
                         );
                     }
 
-                    const beforeFailure = rateLimits.graphql;
-                    if (!beforeFailure) {
-                        throw new Error(
-                            `${failure}；未自动重试：缺少失败前 GraphQL 额度基线，无法证明失败请求未扣点；${error.message || String(error)}`,
-                        );
-                    }
-
-                    let checkedRateLimits;
-                    try {
-                        checkedRateLimits = await fetchRateLimits(token);
-                    } catch (quotaError) {
-                        throw new Error(
-                            `${failure}；额度复核失败，未自动重试：${quotaError.message || String(quotaError)}；原始错误：${error.message || String(error)}`,
-                        );
-                    }
-                    rateLimits.rest =
-                        checkedRateLimits.rest || rateLimits.rest;
-                    rateLimits.graphql =
-                        checkedRateLimits.graphql || rateLimits.graphql;
-                    const afterFailure = checkedRateLimits.graphql;
-                    let unsafeReason = "";
-                    let safeReason = "";
-                    if (!afterFailure) {
-                        unsafeReason = "额度查询未返回 GraphQL 数据";
-                    } else if (afterFailure.remaining <= 0) {
-                        unsafeReason = `GraphQL 剩余额度为 ${afterFailure.remaining}/${afterFailure.limit}`;
-                    } else if (
-                        beforeFailure.resetAt !== afterFailure.resetAt
-                    ) {
-                        if (
-                            afterFailure.used === 0 &&
-                            afterFailure.remaining === afterFailure.limit
-                        ) {
-                            safeReason = `GraphQL 额度窗口已重置且新窗口为 0/${afterFailure.limit}，旧窗口消耗已失效，可安全重试`;
-                        } else {
-                            unsafeReason = `GraphQL 额度窗口已重置，但新窗口已用 ${afterFailure.used}/${afterFailure.limit}，无法排除失败请求已在新窗口扣点`;
-                        }
-                    } else if (beforeFailure.used !== afterFailure.used) {
-                        const delta = afterFailure.used - beforeFailure.used;
-                        if (delta > 0 && afterFailure.remaining > 0) {
-                            safeReason = `失败请求已扣 ${delta} points，但仍剩余 ${afterFailure.remaining}/${afterFailure.limit}；为保留已读取进度继续降级重试`;
-                        } else {
-                            unsafeReason = `GraphQL 已用额度从 ${beforeFailure.used} 变为 ${afterFailure.used}，无法安全继续`;
-                        }
-                    } else {
-                        safeReason = `/rate_limit 确认 GraphQL 已用额度仍为 ${afterFailure.used}/${afterFailure.limit}，失败请求未扣点`;
-                    }
-                    if (unsafeReason) {
-                        throw new Error(
-                            `${failure}；未自动重试：${unsafeReason}；${error.message || String(error)}`,
-                        );
-                    }
-
-                    onProgress(
-                        `${failure}；原因：${error.message || String(error)}；${safeReason}；对象上限 ${pageSize} → ${nextPageSize}/页后自动重试`,
-                        afterFailure,
-                    );
+                    retryCount += 1;
+                    const previousPageSize = pageSize;
                     pageSize = nextPageSize;
                     saveCheckpoint();
+                    const pageSizeMessage =
+                        previousPageSize === pageSize
+                            ? `保持最小对象上限 ${pageSize}/页`
+                            : `对象上限 ${previousPageSize} → ${pageSize}/页`;
+                    onProgress(
+                        `${failure}；原因：${error.message || String(error)}；临时错误不进行额度复核；${pageSizeMessage}；第 ${retryCount} 次自动重试`,
+                        null,
+                    );
                 }
             }
             if (!data?.repository) {
@@ -3005,8 +2955,8 @@
         if (!resumeCheckpoint) clearFetchCheckpoint();
         const graphQlStrategy =
             requestedScope === "open"
-                ? `合并 PR/Issue GraphQL 自适应分页（初始 ${MAX_PAGE_SIZE}/页，失败 -${PAGE_SIZE_STEP}，成功 +${PAGE_SIZE_STEP}）`
-                : `PR/Issue 分离 GraphQL 自适应分页（初始 ${MAX_PAGE_SIZE}/页，失败 -${PAGE_SIZE_STEP}，成功 +${PAGE_SIZE_STEP}）`;
+                ? `合并 PR/Issue GraphQL 自适应分页（初始 ${MAX_PAGE_SIZE}/页，失败 -${PAGE_SIZE_STEP}，成功 +${PAGE_SIZE_STEP}，临时错误始终重试）`
+                : `PR/Issue 分离 GraphQL 自适应分页（初始 ${MAX_PAGE_SIZE}/页，失败 -${PAGE_SIZE_STEP}，成功 +${PAGE_SIZE_STEP}，临时错误始终重试）`;
         const strategy = `${graphQlStrategy} + 单次 Commit 统计${
             requestedOptions.completeInteractions
                 ? " + 完整互动 REST"

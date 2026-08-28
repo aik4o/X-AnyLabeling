@@ -472,79 +472,84 @@ async function testAllHistorySplitsPullsAndIssues() {
 
 async function testGraphqlErrorDetails() {
     const logs = [];
+    const pageSizes = [];
     let graphqlRequests = 0;
     const previousReset = 1773104400;
-    global.GM_xmlhttpRequest = ({ url, onload }) => {
+    const resetAt = new Date(previousReset * 1000).toISOString();
+    global.GM_xmlhttpRequest = ({ url, data, onload }) => {
         if (url === "https://api.github.com/rate_limit") {
+            assert.fail("临时 GraphQL 错误不应触发额度复核");
+        }
+        graphqlRequests += 1;
+        pageSizes.push(JSON.parse(data).variables.pageSize);
+        if (graphqlRequests === 1) {
             onload({
-                status: 200,
-                responseHeaders: "",
-                responseText: JSON.stringify({
-                    resources: {
-                        core: {
-                            limit: 5000,
-                            used: 0,
-                            remaining: 5000,
-                            reset: previousReset + 3600,
-                        },
-                        graphql: {
-                            limit: 5000,
-                            used: 1,
-                            remaining: 4999,
-                            reset: previousReset + 3600,
-                        },
-                    },
-                }),
+                status: 502,
+                statusText: "Bad Gateway",
+                responseHeaders:
+                    "content-type: text/plain\r\nx-github-request-id: TEST:123\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 4940\r\nx-ratelimit-used: 60\r\nx-ratelimit-reset: 1773104400\r\nx-ratelimit-resource: graphql\r\n",
+                responseText: "upstream failure",
             });
             return;
         }
-        graphqlRequests += 1;
         onload({
-            status: 502,
-            statusText: "Bad Gateway",
-            responseHeaders:
-                "content-type: text/plain\r\nx-github-request-id: TEST:123\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 4940\r\nx-ratelimit-used: 60\r\nx-ratelimit-reset: 1773104400\r\nx-ratelimit-resource: graphql\r\n",
-            responseText: "upstream failure",
+            status: 200,
+            responseHeaders: "",
+            responseText: JSON.stringify({
+                data: {
+                    repository: {
+                        pullRequests: {
+                            totalCount: 0,
+                            nodes: [],
+                            pageInfo: {
+                                hasNextPage: false,
+                                endCursor: null,
+                            },
+                        },
+                    },
+                    rateLimit: {
+                        cost: 1,
+                        limit: 5000,
+                        remaining: 4939,
+                        resetAt,
+                        used: 61,
+                    },
+                },
+            }),
         });
     };
 
-    await assert.rejects(
-        stats.fetchRepositoryData(
-            { owner: "o", name: "r" },
-            "token",
-            "all",
-            (message) => logs.push(message),
-            {
-                includeIssues: false,
-                includeCommits: false,
-                completeInteractions: false,
+    await stats.fetchRepositoryData(
+        { owner: "o", name: "r" },
+        "token",
+        "all",
+        (message) => logs.push(message),
+        {
+            includeIssues: false,
+            includeCommits: false,
+            completeInteractions: false,
+        },
+        {
+            rest: null,
+            graphql: {
+                limit: 5000,
+                used: 60,
+                remaining: 4940,
+                resetAt,
+                resource: "graphql",
             },
-            {
-                rest: null,
-                graphql: {
-                    limit: 5000,
-                    used: 60,
-                    remaining: 4940,
-                    resetAt: new Date(previousReset * 1000).toISOString(),
-                    resource: "graphql",
-                },
-            },
-        ),
-        (error) => {
-            assert.match(error.message, /PR 第 1 页.*耗时/);
-            assert.match(error.message, /HTTP 502 Bad Gateway/);
-            assert.match(error.message, /Content-Type text\/plain/);
-            assert.match(error.message, /GitHub Request ID TEST:123/);
-            assert.match(error.message, /已用 60\/5000/);
-            assert.match(error.message, /响应摘要：upstream failure/);
-            assert.match(
-                error.message,
-                /额度窗口已重置.*新窗口已用 1\/5000.*无法排除/,
-            );
-            return true;
         },
     );
-    assert.equal(graphqlRequests, 1);
+    const log = logs.join("\n");
+    assert.match(log, /PR 第 1 页.*耗时/);
+    assert.match(log, /HTTP 502 Bad Gateway/);
+    assert.match(log, /Content-Type text\/plain/);
+    assert.match(log, /GitHub Request ID TEST:123/);
+    assert.match(log, /已用 60\/5000/);
+    assert.match(log, /响应摘要：upstream failure/);
+    assert.match(log, /临时错误不进行额度复核/);
+    assert.equal(graphqlRequests, 2);
+    assert.deepEqual(pageSizes, [100, 90]);
     assert.match(logs[0], /对象上限 100\/页.*互动连接上限 10 条元数据/);
 }
 
@@ -780,8 +785,8 @@ async function testSafeGraphqlPageFallback() {
     assert.deepEqual(pageSizes, [100, 90]);
     assert.equal(result.usage.graphqlRequests, 1);
     assert.equal(result.usage.graphqlPoints, 1);
-    assert.match(logs.join("\n"), /失败请求已扣 3 points.*仍剩余 4897\/5000/);
-    assert.match(logs.join("\n"), /对象上限 100 → 90\/页后自动重试/);
+    assert.match(logs.join("\n"), /临时错误不进行额度复核/);
+    assert.match(logs.join("\n"), /对象上限 100 → 90\/页.*第 1 次自动重试/);
     assert.match(logs.join("\n"), /原因：We couldn't respond to your request in time/);
 }
 
@@ -885,7 +890,72 @@ async function testGraphqlNetworkErrorDetailsAndRetry() {
     assert.match(logs.join("\n"), /网络状态 0（未收到 HTTP 响应）/);
     assert.match(logs.join("\n"), /statusText：NetworkError/);
     assert.match(logs.join("\n"), /readyState：4/);
-    assert.match(logs.join("\n"), /对象上限 100 → 90\/页后自动重试/);
+    assert.match(logs.join("\n"), /对象上限 100 → 90\/页.*第 1 次自动重试/);
+}
+
+async function testGraphqlRetriesAtMinimumPageSize() {
+    const logs = [];
+    const pageSizes = [];
+    const resetAt = "2026-03-10T01:00:00Z";
+    global.GM_xmlhttpRequest = ({ url, data, onload }) => {
+        if (url === "https://api.github.com/rate_limit") {
+            assert.fail("临时 GraphQL 错误不应触发额度复核");
+        }
+        const variables = JSON.parse(data).variables;
+        pageSizes.push(variables.pageSize);
+        if (pageSizes.length <= 10) {
+            onload({
+                status: 502,
+                statusText: "Bad Gateway",
+                responseHeaders: "content-type: text/html\r\n",
+                responseText: "<html>upstream failure</html>",
+            });
+            return;
+        }
+        onload({
+            status: 200,
+            responseHeaders: "",
+            responseText: JSON.stringify({
+                data: {
+                    repository: {
+                        pullRequests: {
+                            totalCount: 0,
+                            nodes: [],
+                            pageInfo: {
+                                hasNextPage: false,
+                                endCursor: null,
+                            },
+                        },
+                    },
+                    rateLimit: {
+                        cost: 1,
+                        limit: 5000,
+                        remaining: 4999,
+                        resetAt,
+                        used: 1,
+                    },
+                },
+            }),
+        });
+    };
+
+    await stats.fetchRepositoryData(
+        { owner: "o", name: "r" },
+        "token",
+        "all",
+        (message) => logs.push(message),
+        {
+            includeIssues: false,
+            includeCommits: false,
+            completeInteractions: false,
+        },
+    );
+
+    assert.deepEqual(pageSizes, [100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 10]);
+    assert.match(
+        logs.join("\n"),
+        /保持最小对象上限 10\/页.*第 10 次自动重试/,
+    );
 }
 
 async function testPageSizeDropsAndRecoversByTen() {
@@ -987,7 +1057,7 @@ async function testPageSizeDropsAndRecoversByTen() {
     );
 
     assert.deepEqual(pageSizes, [100, 100, 90, 100, 100]);
-    assert.match(logs.join("\n"), /对象上限 100 → 90\/页后自动重试/);
+    assert.match(logs.join("\n"), /对象上限 100 → 90\/页.*第 1 次自动重试/);
     assert.match(
         logs.join("\n"),
         /本页成功；后续页对象上限 90 → 100\/页/,
@@ -1048,6 +1118,7 @@ testSeparatedLocalAnalysis()
     .then(testGraphqlPauseAndResumeFromCheckpoint)
     .then(testSafeGraphqlPageFallback)
     .then(testGraphqlNetworkErrorDetailsAndRetry)
+    .then(testGraphqlRetriesAtMinimumPageSize)
     .then(testPageSizeDropsAndRecoversByTen)
     .then(testRateLimitLookup)
     .then(() => console.log("github_pr_statistics tests passed"))
