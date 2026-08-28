@@ -30,6 +30,12 @@ assert.match(
 assert.match(userscriptSource, /role="dialog" aria-labelledby="title"/);
 assert.match(userscriptSource, /id="status" role="status" aria-live="polite"/);
 assert.match(userscriptSource, /id="log" role="log" aria-live="off"/);
+assert.match(userscriptSource, /id="copy-log"/);
+assert.match(
+    userscriptSource,
+    /ui\.copyLog\.addEventListener\("click", copyFullLog\)/,
+);
+assert.match(userscriptSource, /navigator\.clipboard\?\.writeText/);
 assert.match(userscriptSource, /id="snapshot" class="snapshot-strip"/);
 assert.match(userscriptSource, /pullRequestTrend: buildPullRequestTrend/);
 assert.match(userscriptSource, /data-trend-range="start"/);
@@ -672,6 +678,78 @@ async function testGraphqlErrorDetails() {
     assert.match(logs[0], /对象上限 100\/页.*互动连接上限 10 条元数据/);
 }
 
+async function testEmptyGraphqlResponseRetries() {
+    const logs = [];
+    const pageSizes = [];
+    const resetAt = "2026-03-10T01:00:00Z";
+    let graphqlAttempts = 0;
+    global.GM_xmlhttpRequest = ({ url, data, onload }) => {
+        assert.equal(url, "https://api.github.com/graphql");
+        graphqlAttempts += 1;
+        const variables = JSON.parse(data).variables;
+        pageSizes.push(variables.pageSize);
+        if (graphqlAttempts === 1) {
+            onload({
+                status: 200,
+                statusText: "OK",
+                responseHeaders:
+                    "content-type: application/json; charset=utf-8\r\n" +
+                    "x-github-request-id: EMPTY:200\r\n",
+                responseText: "",
+            });
+            return;
+        }
+        onload({
+            status: 200,
+            statusText: "OK",
+            responseHeaders: "content-type: application/json\r\n",
+            responseText: JSON.stringify({
+                data: {
+                    repository: {
+                        pullRequests: {
+                            totalCount: 0,
+                            nodes: [],
+                            pageInfo: {
+                                hasNextPage: false,
+                                endCursor: null,
+                            },
+                        },
+                    },
+                    rateLimit: {
+                        cost: 1,
+                        limit: 5000,
+                        remaining: 4999,
+                        resetAt,
+                        used: 1,
+                    },
+                },
+            }),
+        });
+    };
+
+    await stats.fetchRepositoryData(
+        { owner: "o", name: "r" },
+        "token",
+        "all",
+        (message) => logs.push(message),
+        {
+            includeIssues: false,
+            includeCommits: false,
+            completeInteractions: false,
+        },
+    );
+
+    const log = logs.join("\n");
+    assert.equal(graphqlAttempts, 2);
+    assert.deepEqual(pageSizes, [100, 90]);
+    assert.match(log, /GitHub GraphQL 返回空响应/);
+    assert.match(log, /HTTP 200 OK/);
+    assert.match(log, /响应 0 字符/);
+    assert.match(log, /Content-Type application\/json; charset=utf-8/);
+    assert.match(log, /GitHub Request ID EMPTY:200/);
+    assert.match(log, /对象上限 100 → 90\/页.*第 1 次自动重试/);
+}
+
 async function testGraphqlWatchdogAbortsHungRequest() {
     const heartbeats = [];
     let aborted = false;
@@ -1281,6 +1359,7 @@ async function testInvalidTokenLookup() {
 testSeparatedLocalAnalysis()
     .then(testAllHistorySplitsPullsAndIssues)
     .then(testGraphqlErrorDetails)
+    .then(testEmptyGraphqlResponseRetries)
     .then(testGraphqlWatchdogAbortsHungRequest)
     .then(testGraphqlPauseAndResumeFromCheckpoint)
     .then(testSafeGraphqlPageFallback)

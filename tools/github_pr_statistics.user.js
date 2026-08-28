@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.23
+// @version      0.6.24
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.23";
+    const SCRIPT_VERSION = "0.6.24";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -1026,6 +1026,8 @@
     function isRetryableGraphqlFailure(error) {
         return (
             error?.transport === true ||
+            (error?.emptyResponse === true &&
+                Number(error?.status) === 200) ||
             [500, 502, 503, 504].includes(Number(error?.status)) ||
             /请求超时|respond to your request in time|timed out|timeout/i.test(
                 String(error?.message || error || ""),
@@ -1111,13 +1113,17 @@
                 data: JSON.stringify({ query, variables }),
                 timeout: GRAPHQL_REQUEST_TIMEOUT_MS,
                 onload(response) {
+                    const responseText =
+                        typeof response.responseText === "string"
+                            ? response.responseText
+                            : typeof response.response === "string"
+                              ? response.response
+                              : "";
                     let payload;
                     try {
-                        payload = JSON.parse(response.responseText);
+                        payload = JSON.parse(responseText);
                     } catch (_error) {
-                        const responseText = String(
-                            response.responseText || "",
-                        );
+                        const emptyResponse = !responseText.trim();
                         const preview = responseText
                             .trim()
                             .replace(/\s+/g, " ")
@@ -1154,9 +1160,10 @@
                         }
                         if (preview) details.push(`响应摘要：${preview}`);
                         const error = new Error(
-                            `GitHub GraphQL 返回非 JSON；${details.join("；")}`,
+                            `GitHub GraphQL ${emptyResponse ? "返回空响应" : "返回非 JSON"}；${details.join("；")}`,
                         );
                         error.status = response.status;
+                        error.emptyResponse = emptyResponse;
                         finish(reject, error);
                         return;
                     }
@@ -3148,6 +3155,48 @@
         ui.log.scrollTop = ui.log.scrollHeight;
     }
 
+    async function copyFullLog() {
+        const text = ui.log.textContent || "";
+        if (!text.trim()) {
+            setStatus("当前没有可复制的日志", "error");
+            return;
+        }
+        let copied = false;
+        try {
+            if (navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(text);
+                copied = true;
+            }
+        } catch (_error) {
+            // 浏览器可能拒绝异步剪贴板权限，继续使用同步回退。
+        }
+        if (!copied) {
+            const textarea = document.createElement("textarea");
+            textarea.value = text;
+            textarea.readOnly = true;
+            textarea.style.cssText =
+                "position:fixed;left:-9999px;top:0;opacity:0";
+            try {
+                document.body.appendChild(textarea);
+                textarea.select();
+                copied = document.execCommand("copy");
+            } catch (_error) {
+                copied = false;
+            } finally {
+                textarea.remove();
+            }
+        }
+        if (!copied) {
+            setStatus(
+                "复制完整日志失败；请检查浏览器剪贴板权限后重试",
+                "error",
+            );
+            return;
+        }
+        const lineCount = text.trimEnd().split("\n").length;
+        setStatus(`已复制完整日志（${lineCount} 行）`, "success");
+    }
+
     function setProgress(value, label) {
         ui.progressWrap.hidden = false;
         ui.progressLabel.textContent = label;
@@ -3691,6 +3740,7 @@
             .snapshot-strip b { color: var(--text); font-weight: 600; }
             .snapshot-coverage[data-complete="false"] { font-weight: 600; }
             #log { max-height: 160px; overflow: auto; margin: 8px 0 0; padding: 8px; color: var(--text); background: var(--muted-bg); border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
+            .log-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
             .section { margin-top: 18px; }
             .section h3 { margin: 0 0 8px; font-size: 15px; }
             .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 8px; margin: 10px 0; }
@@ -3855,6 +3905,7 @@
               </details>
               <details open>
                 <summary>分析日志</summary>
+                <div class="log-actions"><button id="copy-log" class="button" type="button">复制完整日志</button></div>
                 <pre id="log" role="log" aria-live="off"></pre>
               </details>
               <details id="settings">
@@ -3904,6 +3955,7 @@
             progressPercent: get("#progress-percent"),
             snapshot: get("#snapshot"),
             log: get("#log"),
+            copyLog: get("#copy-log"),
             cards: get("#cards"),
             prCharts: get("#pr-charts"),
             table: get("#table"),
@@ -3959,6 +4011,7 @@
         ui.pause.addEventListener("click", requestPause);
         ui.refreshRateLimits.addEventListener("click", refreshRateLimits);
         ui.export.addEventListener("click", exportAnalysis);
+        ui.copyLog.addEventListener("click", copyFullLog);
         ui.scopeAll.addEventListener("click", () => setScope("all"));
         ui.scopeOpen.addEventListener("click", () => setScope("open"));
         ui.saveToken.addEventListener("click", saveToken);
