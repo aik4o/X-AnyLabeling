@@ -262,6 +262,32 @@ assert.match(lineMarkup, />时间<\/text>/);
 assert.match(lineMarkup, />PR 数量<\/text>/);
 assert.doesNotMatch(lineMarkup, /NaN|Infinity/);
 
+const detailedAxisMarkup = stats.lineChartMarkup(
+    "详细坐标轴",
+    Array.from({ length: 24 }, (_item, index) => `M${index + 1}`),
+    [
+        {
+            label: "PR 数",
+            tone: "blue",
+            values: Array.from({ length: 24 }, (_item, index) =>
+                index === 12 ? 14 : index % 4,
+            ),
+        },
+    ],
+    "PR 数量",
+);
+assert.equal(
+    (detailedAxisMarkup.match(/line-axis-label line-x-label/g) || []).length,
+    12,
+);
+assert.equal(
+    (detailedAxisMarkup.match(/line-axis-label line-y-label/g) || []).length,
+    6,
+);
+for (const tick of [0, 3, 6, 9, 12, 15]) {
+    assert.match(detailedAxisMarkup, new RegExp(`>${tick}<\\/text>`));
+}
+
 async function testSeparatedLocalAnalysis() {
     const progress = [];
     const originalRequest = global.GM_xmlhttpRequest;

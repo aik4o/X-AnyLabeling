@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.12
+// @version      0.6.13
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.12";
+    const SCRIPT_VERSION = "0.6.13";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -2110,9 +2110,10 @@
         const safeSeries = (series || []).map((item) => ({
             label: item.label,
             tone: CHART_COLORS[item.tone] ? item.tone : "blue",
-            values: safeLabels.map((_label, index) =>
-                Math.max(0, Number(item.values?.[index]) || 0),
-            ),
+            values: safeLabels.map((_label, index) => {
+                const value = Number(item.values?.[index]);
+                return Number.isFinite(value) ? Math.max(0, value) : 0;
+            }),
         }));
         if (!safeLabels.length || !safeSeries.length) return "";
 
@@ -2121,23 +2122,40 @@
         const top = 15;
         const bottom = 215;
         const height = bottom - top;
-        const maximum = Math.max(
+        const dataMaximum = Math.max(
             1,
             ...safeSeries.flatMap((item) => item.values),
+        );
+        const roughStep = Math.max(1, Math.ceil(dataMaximum / 5));
+        const magnitude = 10 ** Math.floor(Math.log10(roughStep));
+        const normalizedStep = roughStep / magnitude;
+        const tickStep =
+            (normalizedStep <= 1
+                ? 1
+                : normalizedStep <= 2
+                  ? 2
+                  : normalizedStep <= 3
+                    ? 3
+                    : normalizedStep <= 5
+                      ? 5
+                      : 10) * magnitude;
+        const maximum = Math.ceil(dataMaximum / tickStep) * tickStep;
+        const yTicks = Array.from(
+            { length: Math.round(maximum / tickStep) + 1 },
+            (_item, index) => maximum - index * tickStep,
         );
         const x = (index) =>
             safeLabels.length === 1
                 ? (left + right) / 2
                 : left + ((right - left) * index) / (safeLabels.length - 1);
         const y = (value) => bottom - (height * value) / maximum;
-        const labelIndexes = (
-            safeLabels.length <= 6
-                ? safeLabels.map((_label, index) => index)
-                : [
-                      0,
-                      Math.floor((safeLabels.length - 1) / 2),
-                      safeLabels.length - 1,
-                  ]
+        const xTickCount = Math.min(12, safeLabels.length);
+        const labelIndexes = Array.from({ length: xTickCount }, (_item, index) =>
+            xTickCount === 1
+                ? 0
+                : Math.round(
+                      (index * (safeLabels.length - 1)) / (xTickCount - 1),
+                  ),
         ).filter((value, index, all) => all.indexOf(value) === index);
         const ariaLabel = `${title}；${safeSeries
             .map((item) => item.label)
@@ -2153,13 +2171,26 @@
                     .join("")}
               </div>
               <svg class="line-chart" viewBox="0 0 1000 300" role="img" aria-label="${escapeHtml(ariaLabel)}">
-                ${[maximum, maximum / 2, 0]
-                    .map((value, index) => {
-                        const gridY = top + (height * index) / 2;
-                        const label = Number.isInteger(value)
-                            ? value
-                            : value.toFixed(1);
-                        return `<line class="line-grid" x1="${left}" y1="${gridY}" x2="${right}" y2="${gridY}"></line><text class="line-axis-label" x="0" y="${gridY + 3}">${label}</text>`;
+                <line class="line-axis" x1="${left}" y1="${top}" x2="${left}" y2="${bottom}"></line>
+                <line class="line-axis" x1="${left}" y1="${bottom}" x2="${right}" y2="${bottom}"></line>
+                ${yTicks
+                    .map((value) => {
+                        const gridY = y(value);
+                        return `<line class="line-grid line-y-grid" x1="${left}" y1="${gridY}" x2="${right}" y2="${gridY}"></line><line class="line-tick" x1="${left - 6}" y1="${gridY}" x2="${left}" y2="${gridY}"></line><text class="line-axis-label line-y-label" text-anchor="end" x="${left - 10}" y="${gridY + 5}">${value}</text>`;
+                    })
+                    .join("")}
+                ${labelIndexes
+                    .map((index) => {
+                        const tickX = x(index);
+                        const anchor =
+                            safeLabels.length === 1
+                                ? "middle"
+                                : index === 0
+                                  ? "start"
+                                  : index === safeLabels.length - 1
+                                    ? "end"
+                                    : "middle";
+                        return `<line class="line-grid line-x-grid" x1="${tickX}" y1="${top}" x2="${tickX}" y2="${bottom}"></line><line class="line-tick" x1="${tickX}" y1="${bottom}" x2="${tickX}" y2="${bottom + 6}"></line><text class="line-axis-label line-x-label" text-anchor="${anchor}" x="${tickX}" y="260">${escapeHtml(safeLabels[index])}</text>`;
                     })
                     .join("")}
                 ${safeSeries
@@ -2179,19 +2210,6 @@
                               )
                               .join("")}
                         `;
-                    })
-                    .join("")}
-                ${labelIndexes
-                    .map((index) => {
-                        const anchor =
-                            safeLabels.length === 1
-                                ? "middle"
-                                : index === 0
-                                  ? "start"
-                                  : index === safeLabels.length - 1
-                                    ? "end"
-                                    : "middle";
-                        return `<text class="line-axis-label" text-anchor="${anchor}" x="${x(index)}" y="260">${escapeHtml(safeLabels[index])}</text>`;
                     })
                     .join("")}
                 <text class="line-axis-title" text-anchor="middle" x="520" y="292">时间</text>
@@ -3234,6 +3252,8 @@
             .line-chart-card { grid-column: 1 / -1; }
             .line-chart { display: block; width: 100%; height: auto; overflow: visible; }
             .line-grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+            .line-x-grid { opacity: .35; }
+            .line-axis, .line-tick { stroke: var(--muted); stroke-width: 1.25; vector-effect: non-scaling-stroke; }
             .line-path { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
             .line-point { stroke: var(--panel-bg); stroke-width: 2; vector-effect: non-scaling-stroke; }
             .line-axis-label { fill: var(--muted); font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
