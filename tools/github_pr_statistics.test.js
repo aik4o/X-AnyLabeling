@@ -25,8 +25,14 @@ assert.doesNotMatch(
 assert.match(userscriptSource, /let scope = "all";/);
 assert.match(
     userscriptSource,
-    /<button id="scope-all" class="active">全部历史<\/button>/,
+    /<button id="scope-all" class="active" aria-pressed="true">全部历史<\/button>/,
 );
+assert.match(userscriptSource, /role="dialog" aria-labelledby="title"/);
+assert.match(userscriptSource, /id="status" role="status" aria-live="polite"/);
+assert.match(userscriptSource, /id="log" role="log" aria-live="off"/);
+assert.match(userscriptSource, /id="snapshot" class="snapshot-strip"/);
+assert.match(userscriptSource, /pullRequestTrend: buildPullRequestTrend/);
+assert.match(userscriptSource, /ui\.panel\.setAttribute\("aria-busy"/);
 assert.match(
     userscriptSource,
     /GitHub 实时额度复核失败；不使用本地累计值代替/,
@@ -258,11 +264,18 @@ const lineMarkup = stats.lineChartMarkup(
 assert.match(lineMarkup, /class="line-chart"/);
 assert.match(lineMarkup, /data-daily-axis="true"/);
 assert.match(lineMarkup, /class="line-y-axis-sticky"/);
+assert.match(lineMarkup, /class="chart-summary"/);
+assert.match(lineMarkup, /data-scroll-days="-30"/);
+assert.match(lineMarkup, /tabindex="0" role="region"/);
+assert.match(lineMarkup, /class="line-legend-key"/);
 assert.doesNotMatch(lineMarkup, /line-grid/);
 assert.equal((lineMarkup.match(/<polyline/g) || []).length, 1);
 assert.equal((lineMarkup.match(/line-path line-reference/g) || []).length, 4);
+for (const dash of ["12 5", "3 4", "12 4 3 4", "1 5"]) {
+    assert.match(lineMarkup, new RegExp(`stroke-dasharray:${dash}`));
+}
 for (const tone of ["blue", "purple", "green", "orange", "red"]) {
-    assert.match(lineMarkup, new RegExp(`tone-${tone}`));
+    assert.match(lineMarkup, new RegExp(`var\\(--chart-${tone}\\)`));
 }
 assert.match(lineMarkup, />2026-01-02<\/text>/);
 assert.match(lineMarkup, />日期（每日）<\/text>/);
@@ -314,6 +327,10 @@ assert.equal(
     181,
 );
 assert.match(longDailyMarkup, /style="width:5840px;max-width:none"/);
+assert.match(
+    longDailyMarkup,
+    /保留全部 181 个时间点，已隐藏圆点标记以减少渲染/,
+);
 assert.equal((lineMarkup.match(/<circle/g) || []).length, 3);
 
 async function testSeparatedLocalAnalysis() {

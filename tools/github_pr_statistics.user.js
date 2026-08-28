@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.16
+// @version      0.6.17
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.16";
+    const SCRIPT_VERSION = "0.6.17";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -41,6 +41,12 @@
         red: "var(--chart-red)",
         gray: "var(--chart-gray)",
     });
+    const REFERENCE_LINE_DASHES = Object.freeze([
+        "12 5",
+        "3 4",
+        "12 4 3 4",
+        "1 5",
+    ]);
     const DAY_MS = 24 * 60 * 60 * 1000;
     const MAINTAINER_ASSOCIATIONS = new Set([
         "OWNER",
@@ -2135,10 +2141,15 @@
         dailyAxis = false,
     ) {
         const safeLabels = labels.map((label) => String(label));
-        const safeSeries = (series || []).map((item) => ({
+        const safeSeries = (series || []).map((item, index) => ({
             label: item.label,
             tone: CHART_COLORS[item.tone] ? item.tone : "blue",
             reference: Boolean(item.reference),
+            dash: item.reference
+                ? REFERENCE_LINE_DASHES[
+                      Math.max(0, index - 1) % REFERENCE_LINE_DASHES.length
+                  ]
+                : "",
             values: safeLabels.map((_label, index) => {
                 const value = Number(item.values?.[index]);
                 return Number.isFinite(value) ? Math.max(0, value) : 0;
@@ -2192,11 +2203,15 @@
                             (index * (safeLabels.length - 1)) /
                                 (xTickCount - 1),
                         ),
-              ).filter((value, index, all) => all.indexOf(value) === index);
+        ).filter((value, index, all) => all.indexOf(value) === index);
         const showPoints = safeLabels.length <= 180;
-        const ariaLabel = `${title}；${safeSeries
-            .map((item) => item.label)
-            .join("、")}`;
+        const densitySummary = showPoints
+            ? `${safeLabels.length} 个时间点`
+            : `保留全部 ${safeLabels.length} 个时间点，已隐藏圆点标记以减少渲染`;
+        const chartSummary = `时间范围 ${safeLabels[0]} 至 ${safeLabels.at(-1)}；${densitySummary}；末期值：${safeSeries
+            .map((item) => `${item.label} ${item.values.at(-1) || 0}`)
+            .join("，")}`;
+        const ariaLabel = `${title}；${chartSummary}`;
         const yAxisMarkup = `
             <line class="line-axis" x1="${left}" y1="${top}" x2="${left}" y2="${bottom}"></line>
             ${yTicks
@@ -2213,11 +2228,19 @@
               <div class="line-legend">
                 ${safeSeries
                     .map(
-                        (item) => `<span><i class="tone-${item.tone}"></i>${escapeHtml(item.label)}</span>`,
+                        (item) => `<div class="line-legend-item"><svg class="line-legend-key" viewBox="0 0 28 8" aria-hidden="true"><line x1="1" y1="4" x2="27" y2="4" style="stroke:${CHART_COLORS[item.tone]};stroke-width:3;stroke-dasharray:${item.dash || "none"}"></line></svg><span>${escapeHtml(item.label)}</span><strong>${item.values.at(-1) || 0}</strong></div>`,
                     )
                     .join("")}
               </div>
-              <div class="line-chart-scroll" data-daily-axis="${dailyAxis}">
+              <div class="chart-context">
+                <p class="chart-summary">${escapeHtml(chartSummary)}</p>
+                ${
+                    dailyAxis
+                        ? `<div class="line-chart-nav" aria-label="时间轴浏览"><button type="button" class="button" data-scroll-days="-30">← 较早 30 天</button><button type="button" class="button" data-scroll-days="30">较晚 30 天 →</button></div>`
+                        : ""
+                }
+              </div>
+              <div class="line-chart-scroll" data-daily-axis="${dailyAxis}" ${dailyAxis ? `tabindex="0" role="region" aria-label="${escapeHtml(`${title}时间轴；使用左右方向键或前后 30 天按钮浏览`)}"` : ""}>
               ${dailyAxis ? `<svg class="line-y-axis-sticky" viewBox="0 0 70 ${chartHeight}" aria-hidden="true">${yAxisMarkup}</svg>` : ""}
               <svg class="line-chart" viewBox="0 0 ${chartWidth} ${chartHeight}" ${dailyAxis ? `style="width:${chartWidth}px;max-width:none"` : ""} role="img" aria-label="${escapeHtml(ariaLabel)}">
                 ${dailyAxis ? "" : yAxisMarkup}
@@ -2246,7 +2269,7 @@
                         const color = CHART_COLORS[item.tone];
                         if (item.reference) {
                             const value = item.values.at(-1) || 0;
-                            return `<line class="line-path line-reference" style="stroke:${color};stroke-width:2" x1="${left}" y1="${y(value).toFixed(2)}" x2="${right}" y2="${y(value).toFixed(2)}"><title>${escapeHtml(item.label)}：${value}</title></line>`;
+                            return `<line class="line-path line-reference" style="stroke:${color};stroke-width:2;stroke-dasharray:${item.dash}" x1="${left}" y1="${y(value).toFixed(2)}" x2="${right}" y2="${y(value).toFixed(2)}"><title>${escapeHtml(item.label)}：${value}</title></line>`;
                         }
                         const points = item.values
                             .map(
@@ -2273,6 +2296,36 @@
               </div>
             </article>
         `;
+    }
+
+    function initializeDailyChart(container) {
+        const scroller = container.querySelector('[data-daily-axis="true"]');
+        if (!scroller) return;
+        const buttons = [
+            ...container.querySelectorAll("[data-scroll-days]"),
+        ];
+        const updateButtons = () => {
+            const maximum = scroller.scrollWidth - scroller.clientWidth;
+            const earlier = buttons.find(
+                (button) => Number(button.dataset.scrollDays) < 0,
+            );
+            const later = buttons.find(
+                (button) => Number(button.dataset.scrollDays) > 0,
+            );
+            if (earlier) earlier.disabled = scroller.scrollLeft <= 1;
+            if (later) later.disabled = scroller.scrollLeft >= maximum - 1;
+        };
+        for (const button of buttons) {
+            button.addEventListener("click", () => {
+                scroller.scrollBy({
+                    left: Number(button.dataset.scrollDays) * 32,
+                    behavior: "auto",
+                });
+            });
+        }
+        scroller.addEventListener("scroll", updateButtons, { passive: true });
+        scroller.scrollLeft = scroller.scrollWidth;
+        updateButtons();
     }
 
     function contributorRole(row) {
@@ -2362,7 +2415,8 @@
             ],
         ];
         ui.costTable.innerHTML = `
-            <thead><tr><th>信息</th><th>来源</th><th>额外查询</th><th>成本</th><th>评价</th></tr></thead>
+            <caption class="sr-only">信息来源与 GitHub API 成本</caption>
+            <thead><tr><th scope="col">信息</th><th scope="col">来源</th><th scope="col">额外查询</th><th scope="col">成本</th><th scope="col">评价</th></tr></thead>
             <tbody>${rows
                 .map(
                     (row) =>
@@ -2377,6 +2431,16 @@
         const summary = summarizePullRequests(analysis.rows, scope);
         const isOpen = scope === "open";
         const total = summary.total.count;
+        const completeReplies = analysis.coverage.completeInteractions;
+        const fetchedAt = analysis.raw.fetchedAt;
+        ui.snapshot.hidden = false;
+        ui.snapshot.innerHTML = `
+            <strong>非实时数据快照</strong>
+            <span><b>读取时间</b><time datetime="${escapeHtml(fetchedAt)}">${formatDate(fetchedAt)}</time></span>
+            <span><b>显示范围</b>${isOpen ? "仅 Open" : "全部历史"}</span>
+            <span><b>已读取</b>PR ${analysis.rows.length} · Issue ${analysis.issueRows.length}</span>
+            <span class="snapshot-coverage" data-complete="${completeReplies}"><b>回复覆盖</b>${completeReplies ? "完整互动" : "基础元数据，回复率可能偏低"}</span>
+        `;
         const rateRow = (label, value, denominator, tone = "blue") => [
             label,
             percentage(value, denominator),
@@ -2443,26 +2507,24 @@
             "PR 数量",
             true,
         );
-        const dailyChart = ui.prCharts.querySelector(
-            '[data-daily-axis="true"]',
-        );
-        if (dailyChart) dailyChart.scrollLeft = dailyChart.scrollWidth;
+        initializeDailyChart(ui.prCharts);
 
         const mergeHeader = isOpen
             ? ""
-            : "<th>已合并 / 合并率</th>";
+            : '<th scope="col">已合并 / 合并率</th>';
         const prStats = summary.total;
         const denominator = prStats.count;
         ui.table.innerHTML = `
+            <caption class="sr-only">Pull Request 核心统计</caption>
             <thead>
               <tr>
-                <th>PR 数</th>
+                <th scope="col">PR 数</th>
                 ${mergeHeader}
-                <th>提交者回复率</th>
-                <th>维护者回复率</th>
-                <th>30 天 stale</th>
-                <th>首次维护者回复中位数</th>
-                <th>维护者最近回复时间</th>
+                <th scope="col">提交者回复率</th>
+                <th scope="col">维护者回复率</th>
+                <th scope="col">30 天 stale</th>
+                <th scope="col">首次维护者回复中位数</th>
+                <th scope="col">维护者最近回复时间</th>
               </tr>
             </thead>
             <tbody>
@@ -2575,7 +2637,8 @@
                 ),
             ].join("");
             ui.issueTable.innerHTML = `
-                <thead><tr><th>Bug</th><th>Feature</th><th>Docs</th><th>Good first issue</th><th>Help wanted</th></tr></thead>
+                <caption class="sr-only">Issue 分类统计</caption>
+                <thead><tr><th scope="col">Bug</th><th scope="col">Feature</th><th scope="col">Docs</th><th scope="col">Good first issue</th><th scope="col">Help wanted</th></tr></thead>
                 <tbody><tr>
                   <td>${issues.categories.bug}</td>
                   <td>${issues.categories.feature}</td>
@@ -2668,7 +2731,8 @@
             barChartMarkup("最近活跃", contributorActivityRows),
         ].join("");
         ui.contributorTable.innerHTML = `
-            <thead><tr><th>代码贡献者</th><th>最近活跃</th><th>角色</th><th>PR / 合并</th><th>Issue</th><th>评论</th><th>Review</th><th>Commit</th></tr></thead>
+            <caption class="sr-only">代码贡献者明细</caption>
+            <thead><tr><th scope="col">代码贡献者</th><th scope="col">最近活跃</th><th scope="col">角色</th><th scope="col">PR / 合并</th><th scope="col">Issue</th><th scope="col">评论</th><th scope="col">Review</th><th scope="col">Commit</th></tr></thead>
             <tbody>${contributorSummary.rows
                 .slice(0, 25)
                 .map(
@@ -2732,7 +2796,8 @@
                         : "",
                 ].join("");
                 ui.commitTable.innerHTML = `
-                    <thead><tr><th>作者</th><th>Commit</th><th>占比</th></tr></thead>
+                    <caption class="sr-only">Commit 作者明细</caption>
+                    <thead><tr><th scope="col">作者</th><th scope="col">Commit</th><th scope="col">占比</th></tr></thead>
                     <tbody>${commits.authors
                         .slice(0, 20)
                         .map(
@@ -2807,6 +2872,7 @@
 
     function setLoading(value) {
         loading = value;
+        ui.panel.setAttribute("aria-busy", String(value));
         ui.analyze.disabled = value;
         ui.pause.disabled = !value || pauseRequested;
         if (!value) ui.pause.textContent = "暂停";
@@ -2879,6 +2945,8 @@
         }
         ui.issueSection.hidden = true;
         ui.commitSection.hidden = true;
+        ui.snapshot.hidden = true;
+        ui.snapshot.innerHTML = "";
         ui.progressWrap.hidden = true;
         ui.export.disabled = true;
     }
@@ -3130,6 +3198,7 @@
             usage: analysis.usage,
             derived: {
                 pullRequests: analysis.rows,
+                pullRequestTrend: buildPullRequestTrend(analysis.rows, scope),
                 issues: analysis.issueRows,
                 contributors: analysis.contributors,
                 commits: analysis.commitStats,
@@ -3191,16 +3260,23 @@
               --muted: var(--fgColor-muted, var(--color-fg-muted, #59636e));
               --border: var(--borderColor-default, var(--color-border-default, #d0d7de));
               --accent: var(--fgColor-accent, var(--color-accent-fg, #0969da));
-              --chart-blue: #2f81f7;
-              --chart-green: #3fb950;
-              --chart-orange: #d29922;
-              --chart-purple: #a371f7;
-              --chart-red: #f85149;
-              --chart-gray: #8c959f;
+              --chart-blue: #0969da;
+              --chart-green: #1a7f37;
+              --chart-orange: #9a6700;
+              --chart-purple: #8250df;
+              --chart-red: #cf222e;
+              --chart-gray: #57606a;
               font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             }
+            @media (prefers-color-scheme: dark) {
+              :host { --chart-blue: #58a6ff; --chart-green: #3fb950; --chart-orange: #d29922; --chart-purple: #bc8cff; --chart-red: #ff7b72; --chart-gray: #8b949e; }
+            }
+            :host-context([data-color-mode="light"]) { --chart-blue: #0969da; --chart-green: #1a7f37; --chart-orange: #9a6700; --chart-purple: #8250df; --chart-red: #cf222e; --chart-gray: #57606a; }
+            :host-context([data-color-mode="dark"]) { --chart-blue: #58a6ff; --chart-green: #3fb950; --chart-orange: #d29922; --chart-purple: #bc8cff; --chart-red: #ff7b72; --chart-gray: #8b949e; }
             [hidden] { display: none !important; }
+            .sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
             button, input { font: inherit; }
+            button:focus-visible, input:focus-visible, summary:focus-visible, .line-chart-scroll:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
             #launcher {
               position: fixed;
               right: 22px;
@@ -3261,11 +3337,16 @@
             .scope button:last-child { border-right: 0; }
             .scope button.active { color: #fff; background: var(--accent); }
             #status { margin: 10px 0; color: var(--muted); overflow-wrap: anywhere; }
-            #status[data-type="error"] { color: #cf222e; }
-            #status[data-type="success"] { color: #1a7f37; }
+            #status[data-type="error"] { color: var(--chart-red); }
+            #status[data-type="success"] { color: var(--chart-green); }
             #progress-wrap { margin: 8px 0 10px; }
             #progress-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 4px; color: var(--muted); font-size: 12px; }
             #progress { width: 100%; height: 12px; accent-color: var(--accent); }
+            .snapshot-strip { display: flex; align-items: center; gap: 6px 14px; flex-wrap: wrap; margin: 10px 0 4px; padding: 9px 10px; background: var(--muted-bg); border: 1px solid var(--border); border-radius: 8px; }
+            .snapshot-strip > strong { color: var(--text); }
+            .snapshot-strip span { display: inline-flex; gap: 5px; color: var(--muted); }
+            .snapshot-strip b { color: var(--text); font-weight: 600; }
+            .snapshot-coverage[data-complete="false"] { font-weight: 600; }
             #log { max-height: 160px; overflow: auto; margin: 8px 0 0; padding: 8px; color: var(--text); background: var(--muted-bg); border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
             .section { margin-top: 18px; }
             .section h3 { margin: 0 0 8px; font-size: 15px; }
@@ -3308,10 +3389,15 @@
             .donut-legend-row span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
             .donut-legend-row strong { font-size: 12px; }
             .line-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: -4px 0 6px; color: var(--muted); font-size: 11px; }
-            .line-legend span { display: inline-flex; align-items: center; gap: 5px; }
-            .line-legend i { width: 9px; height: 9px; border-radius: 50%; }
+            .line-legend-item { display: inline-flex; align-items: center; gap: 5px; }
+            .line-legend-key { flex: none; width: 28px; height: 8px; overflow: visible; }
+            .line-legend-item strong { color: var(--text); font-size: 11px; }
+            .chart-context { display: flex; align-items: center; justify-content: space-between; gap: 8px 14px; flex-wrap: wrap; margin: 5px 0 7px; }
+            .chart-summary { flex: 1 1 420px; margin: 0; color: var(--muted); line-height: 1.45; }
+            .line-chart-nav { display: inline-flex; gap: 6px; }
+            .line-chart-nav .button { min-height: 36px; }
             .line-chart-card { grid-column: 1 / -1; }
-            .line-chart-scroll { position: relative; width: 100%; overflow-x: auto; overflow-y: hidden; white-space: nowrap; }
+            .line-chart-scroll { position: relative; width: 100%; overflow-x: auto; overflow-y: hidden; overscroll-behavior-inline: contain; white-space: nowrap; }
             .line-chart-scroll > .line-chart { display: inline-block; vertical-align: top; }
             .line-y-axis-sticky { position: sticky; left: 0; z-index: 1; display: inline-block; width: 70px; height: 330px; margin-right: -70px; vertical-align: top; background: var(--panel-bg); pointer-events: none; }
             .line-chart { display: block; width: 100%; height: auto; overflow: visible; }
@@ -3333,7 +3419,7 @@
             details { margin-top: 12px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; }
             details.table-details { margin-top: 10px; }
             summary { cursor: pointer; font-weight: 600; }
-            #token-state[data-configured="true"] { color: #1a7f37; }
+            #token-state[data-configured="true"] { color: var(--chart-green); }
             .token-row { display: flex; gap: 7px; margin-top: 10px; }
             #token { flex: 1; min-width: 160px; padding: 6px 8px; color: var(--text); background: var(--panel-bg); border: 1px solid var(--border); border-radius: 6px; }
             .help { margin: 8px 0 0; color: var(--muted); line-height: 1.5; }
@@ -3341,19 +3427,23 @@
               #panel { right: 8px; bottom: 58px; width: calc(100vw - 16px); max-height: calc(100vh - 70px); }
               #launcher { right: 10px; bottom: 10px; }
               .card.latest { grid-column: span 1; }
+              .snapshot-strip { display: grid; grid-template-columns: 1fr; }
+              .chart-context { align-items: stretch; }
+              .line-chart-nav { display: grid; grid-template-columns: 1fr 1fr; width: 100%; }
+              .line-chart-nav .button { min-height: 44px; }
             }
           </style>
           <button id="launcher" aria-controls="panel" aria-expanded="false" hidden>仓库统计</button>
-          <section id="panel" hidden aria-label="GitHub 仓库统计">
+          <section id="panel" hidden role="dialog" aria-labelledby="title" aria-modal="false" tabindex="-1">
             <header>
               <h2 id="title">GitHub 仓库统计</h2>
               <button id="close" title="关闭" aria-label="关闭">×</button>
             </header>
             <main>
               <div class="toolbar">
-                <div class="scope" aria-label="统计范围">
-                  <button id="scope-all" class="active">全部历史</button>
-                  <button id="scope-open">仅 Open</button>
+                <div class="scope" role="group" aria-label="统计范围">
+                  <button id="scope-all" class="active" aria-pressed="true">全部历史</button>
+                  <button id="scope-open" aria-pressed="false">仅 Open</button>
                 </div>
                 <button id="analyze" class="button primary">开始分析</button>
                 <button id="pause" class="button" disabled>暂停</button>
@@ -3365,11 +3455,12 @@
                 <label><input id="include-commits" type="checkbox" checked>Commit 概览（1 REST）</label>
                 <label title="Open 模式至少每个 PR 一次 REST；全部历史按每 100 条行内评论一次 REST"><input id="complete-interactions" type="checkbox">完整互动（高成本）</label>
               </div>
-              <p id="status">请选择范围和选项，然后点击“开始分析”</p>
+              <p id="status" role="status" aria-live="polite">请选择范围和选项，然后点击“开始分析”</p>
               <div id="progress-wrap" hidden>
                 <div id="progress-head"><span id="progress-label"></span><strong id="progress-percent"></strong></div>
                 <progress id="progress" max="100" value="0" aria-labelledby="progress-label"></progress>
               </div>
+              <div id="snapshot" class="snapshot-strip" aria-label="数据快照状态" hidden></div>
               <section class="section">
                 <h3>Pull Request</h3>
                 <div id="cards" class="cards"></div>
@@ -3400,7 +3491,7 @@
               </details>
               <details open>
                 <summary>分析日志</summary>
-                <pre id="log" role="log" aria-live="polite"></pre>
+                <pre id="log" role="log" aria-live="off"></pre>
               </details>
               <details id="settings">
                 <summary>GitHub Token 设置（<span id="token-state">未配置</span>）</summary>
@@ -3416,7 +3507,7 @@
               </details>
               <p class="help">
                 主 GraphQL 查询保留 PR/Issue 标题和正文；评论/Review 只请求作者、身份关系、发布时间和修改时间，不请求正文。“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
-                PR 蓝线按创建日期累计，缺失日期沿用前一天累计值；提交者回复、维护者回复和 stale 显示为当前总数的水平参考线。图中不显示网格；横坐标每天显示一个完整日期，历史较长时可横向滚动并默认定位到最新日期，Y 轴会固定在左侧。回复与 stale 是当前分析状态，并非历史快照。stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
+                PR 实线按创建日期累计，缺失日期沿用前一天累计值；提交者回复、维护者回复和 stale 显示为当前总数的不同线型水平参考线，图例与文字摘要始终显示数值，不只依赖颜色或悬停。图中不显示网格；横坐标每天显示一个完整日期，历史较长时可用键盘、滚动或前后 30 天按钮浏览并默认定位到最新日期，Y 轴会固定在左侧。回复与 stale 是当前分析状态，并非历史快照。stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
                 贡献者仅统计提交过 PR 或出现在 Commit 数据中的代码贡献者，Issue-only 用户不计入。核心贡献者默认指内部成员，或达到 5 个合并 PR、10 次 Review、20 个 Commit 任一阈值。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
                 执行流程严格分为“读取原始数据”和“本地分析”两个阶段；只有读取阶段访问 GitHub API，本地分析每处理 50 条更新一次日志和进度条。点击“暂停”会等待当前 API 请求完成，再保存检查点并停止。
               </p>
@@ -3446,6 +3537,7 @@
             progress: get("#progress"),
             progressLabel: get("#progress-label"),
             progressPercent: get("#progress-percent"),
+            snapshot: get("#snapshot"),
             log: get("#log"),
             cards: get("#cards"),
             prCharts: get("#pr-charts"),
@@ -3478,15 +3570,24 @@
         }
 
         ui.launcher.addEventListener("click", () => {
-            ui.panel.hidden = !ui.panel.hidden;
+            const opening = ui.panel.hidden;
+            ui.panel.hidden = !opening;
             ui.launcher.setAttribute(
                 "aria-expanded",
                 String(!ui.panel.hidden),
             );
+            if (opening) ui.close.focus();
         });
         ui.close.addEventListener("click", () => {
             ui.panel.hidden = true;
             ui.launcher.setAttribute("aria-expanded", "false");
+            ui.launcher.focus();
+        });
+        ui.panel.addEventListener("keydown", (event) => {
+            if (event.key !== "Escape") return;
+            ui.panel.hidden = true;
+            ui.launcher.setAttribute("aria-expanded", "false");
+            ui.launcher.focus();
         });
         ui.analyze.addEventListener("click", runAnalysis);
         ui.pause.addEventListener("click", requestPause);
@@ -3510,12 +3611,19 @@
         renderCostGuide();
     }
 
+    function updateScopeButtons() {
+        const isAll = scope === "all";
+        ui.scopeAll.classList.toggle("active", isAll);
+        ui.scopeOpen.classList.toggle("active", !isAll);
+        ui.scopeAll.setAttribute("aria-pressed", String(isAll));
+        ui.scopeOpen.setAttribute("aria-pressed", String(!isAll));
+    }
+
     function setScope(value) {
         if (loading || value === scope) return;
         clearFetchCheckpoint();
         scope = value;
-        ui.scopeAll.classList.toggle("active", value === "all");
-        ui.scopeOpen.classList.toggle("active", value === "open");
+        updateScopeButtons();
         if (
             analysis &&
             (analyzedScope === "all" || analyzedScope === value)
@@ -3558,8 +3666,7 @@
                 fetchCheckpoint?.repository?.name === repository.name
             ) {
                 scope = fetchCheckpoint.selectedScope;
-                ui.scopeAll.classList.toggle("active", scope === "all");
-                ui.scopeOpen.classList.toggle("active", scope === "open");
+                updateScopeButtons();
                 for (const [key, fallback] of Object.entries(DEFAULT_OPTIONS)) {
                     ui[key].checked =
                         typeof fetchCheckpoint.selectedOptions?.[key] ===
