@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.21
+// @version      0.6.22
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.21";
+    const SCRIPT_VERSION = "0.6.22";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -575,13 +575,11 @@
                 {
                     label: "累计 Merge PR",
                     tone: "purple",
-                    dash: "10 4",
                     values: mergedValues,
                 },
                 {
                     label: "累计 Close PR（未合并）",
                     tone: "red",
-                    dash: "3 4",
                     values: closedValues,
                 },
             ],
@@ -2155,6 +2153,31 @@
         `;
     }
 
+    function recentMonthsStartIndex(labels, monthCount = 2) {
+        if (!labels.length) return 0;
+        const end = new Date(`${labels.at(-1)}T00:00:00Z`);
+        if (Number.isNaN(end.getTime())) return 0;
+        const months = Math.max(0, Math.trunc(Number(monthCount) || 0));
+        const targetMonth = new Date(
+            Date.UTC(
+                end.getUTCFullYear(),
+                end.getUTCMonth() - months,
+                1,
+            ),
+        );
+        const lastTargetDay = new Date(
+            Date.UTC(
+                targetMonth.getUTCFullYear(),
+                targetMonth.getUTCMonth() + 1,
+                0,
+            ),
+        ).getUTCDate();
+        targetMonth.setUTCDate(Math.min(end.getUTCDate(), lastTargetDay));
+        const cutoff = targetMonth.toISOString().slice(0, 10);
+        const index = labels.findIndex((label) => String(label) >= cutoff);
+        return index < 0 ? 0 : index;
+    }
+
     function lineChartMarkup(
         title,
         labels,
@@ -2233,10 +2256,12 @@
                               (xTickCount - 1),
                       ),
         ).filter((value, index, all) => all.indexOf(value) === index);
-        const showPoints = safeLabels.length <= 120;
-        const densitySummary = showPoints
-            ? `${safeLabels.length} 个每日数据点`
-            : `保留全部 ${safeLabels.length} 个每日数据点，已隐藏圆点标记以减少渲染`;
+        const showPoints = !dailyAxis && safeLabels.length <= 120;
+        const densitySummary = dailyAxis
+            ? `${safeLabels.length} 个每日数据点，未绘制圆点节点`
+            : showPoints
+              ? `${safeLabels.length} 个数据点`
+              : `保留全部 ${safeLabels.length} 个数据点，已隐藏圆点标记以减少渲染`;
         const chartSummary = `显示区间 ${safeLabels[0]} 至 ${safeLabels.at(-1)}；${densitySummary}；区间末值：${safeSeries
             .map((item) => `${item.label} ${item.values.at(-1) || 0}`)
             .join("，")}${rangeOptions?.note ? `；${rangeOptions.note}` : ""}`;
@@ -2293,6 +2318,22 @@
             const overviewY = (value) =>
                 overviewBottom -
                 ((overviewBottom - overviewTop) * value) / overviewMaximum;
+            const overviewTickCount = Math.min(5, fullLabels.length);
+            const overviewTickIndexes = Array.from(
+                { length: overviewTickCount },
+                (_item, index) =>
+                    overviewTickCount === 1
+                        ? 0
+                        : Math.round(
+                              (index * lastIndex) / (overviewTickCount - 1),
+                          ),
+            ).filter((value, index, all) => all.indexOf(value) === index);
+            const overviewTickLabel = (label) => {
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(label)) return label;
+                if (lastIndex > 365 * 4) return label.slice(0, 4);
+                if (lastIndex > 90) return label.slice(0, 7);
+                return label.slice(5);
+            };
             rangeMarkup = `
               <div class="trend-range-panel">
                 <div class="trend-range-controls" role="group" aria-label="选择 PR 趋势显示区间">
@@ -2303,6 +2344,12 @@
                 <p class="trend-range-status" data-trend-status aria-live="polite">${escapeHtml(`显示 ${fullLabels[startIndex]} 至 ${fullLabels[endIndex]}，共 ${endIndex - startIndex + 1} 天；本地筛选，不调用 API`)}</p>
                 <div class="trend-overview-shell" role="group" aria-label="拖动两个滑块选择日期范围；也可以使用上方日期输入框">
                   <svg class="trend-overview" viewBox="0 0 1000 64" preserveAspectRatio="none" aria-hidden="true">
+                    ${overviewTickIndexes
+                        .map((index) => {
+                            const tickX = overviewX(index).toFixed(2);
+                            return `<line class="trend-overview-tick" x1="${tickX}" y1="48" x2="${tickX}" y2="64"></line>`;
+                        })
+                        .join("")}
                     ${fullSeries
                         .map((item) => {
                             const points = item.values
@@ -2319,11 +2366,31 @@
                   <input class="trend-range trend-range-start" type="range" data-trend-range="start" min="0" max="${lastIndex}" value="${startIndex}" aria-label="选择开始日期">
                   <input class="trend-range trend-range-end" type="range" data-trend-range="end" min="0" max="${lastIndex}" value="${endIndex}" aria-label="选择结束日期">
                 </div>
+                <div class="trend-overview-ticks" aria-hidden="true">
+                  ${overviewTickIndexes
+                      .map((index) => {
+                          const percent =
+                              fullLabels.length === 1
+                                  ? 50
+                                  : (100 * index) / lastIndex;
+                          const translate =
+                              fullLabels.length === 1
+                                  ? "-50%"
+                                  : index === 0
+                                    ? "0"
+                                    : index === lastIndex
+                                      ? "-100%"
+                                      : "-50%";
+                          return `<span class="trend-overview-tick-label" style="left:${percent.toFixed(3)}%;transform:translateX(${translate})">${escapeHtml(overviewTickLabel(fullLabels[index]))}</span>`;
+                      })
+                      .join("")}
+                </div>
               </div>
             `;
         }
         return `
             <article class="chart-card line-chart-card">
+              <div data-trend-main>
               <h4>${escapeHtml(title)}</h4>
               <div class="line-legend">
                 ${safeSeries
@@ -2384,6 +2451,7 @@
                 <text class="line-axis-title" text-anchor="middle" x="${(left + right) / 2}" y="292">${dailyAxis ? "日期（每日）" : "时间"}</text>
               </svg>
               </div>
+              </div>
               ${rangeMarkup}
             </article>
         `;
@@ -2395,28 +2463,33 @@
             container.innerHTML = "";
             return;
         }
-        let startIndex = 0;
+        let startIndex = recentMonthsStartIndex(labels);
         let endIndex = labels.length - 1;
-        const render = () => {
+        const chartMarkup = (includeRange) => {
             const visibleLabels = labels.slice(startIndex, endIndex + 1);
             const visibleSeries = config.series.map((item) => ({
                 ...item,
                 values: item.values.slice(startIndex, endIndex + 1),
             }));
-            container.innerHTML = lineChartMarkup(
+            return lineChartMarkup(
                 config.title,
                 visibleLabels,
                 visibleSeries,
                 config.yAxisLabel,
                 true,
-                {
-                    fullLabels: labels,
-                    fullSeries: config.series,
-                    startIndex,
-                    endIndex,
-                    note: config.note,
-                },
+                includeRange
+                    ? {
+                          fullLabels: labels,
+                          fullSeries: config.series,
+                          startIndex,
+                          endIndex,
+                          note: config.note,
+                      }
+                    : { note: config.note },
             );
+        };
+        const render = () => {
+            container.innerHTML = chartMarkup(true);
             const startRange = container.querySelector(
                 '[data-trend-range="start"]',
             );
@@ -2433,6 +2506,23 @@
                 "[data-trend-selection]",
             );
             const status = container.querySelector("[data-trend-status]");
+            let renderFrame = null;
+            const renderMainChart = () => {
+                const staging = document.createElement("div");
+                staging.innerHTML = chartMarkup(false);
+                const currentMain = container.querySelector(
+                    "[data-trend-main]",
+                );
+                const nextMain = staging.querySelector("[data-trend-main]");
+                if (currentMain && nextMain) currentMain.replaceWith(nextMain);
+            };
+            const scheduleMainRender = () => {
+                if (renderFrame !== null) return;
+                renderFrame = requestAnimationFrame(() => {
+                    renderFrame = null;
+                    renderMainChart();
+                });
+            };
             const updatePreview = (changed) => {
                 let nextStart = Number(startRange.value);
                 let nextEnd = Number(endRange.value);
@@ -2457,10 +2547,16 @@
                 status.textContent = `显示 ${labels[startIndex]} 至 ${labels[endIndex]}，共 ${endIndex - startIndex + 1} 天；本地筛选，不调用 API`;
             };
             for (const range of [startRange, endRange]) {
-                range.addEventListener("input", () =>
-                    updatePreview(range.dataset.trendRange),
-                );
-                range.addEventListener("change", render);
+                range.addEventListener("input", () => {
+                    updatePreview(range.dataset.trendRange);
+                    scheduleMainRender();
+                });
+                range.addEventListener("change", () => {
+                    if (renderFrame !== null) {
+                        cancelAnimationFrame(renderFrame);
+                    }
+                    render();
+                });
             }
             for (const dateInput of [startDate, endDate]) {
                 dateInput.addEventListener("change", () => {
@@ -3621,7 +3717,10 @@
             .trend-range-status { margin: 7px 0; color: var(--muted); font-size: 11px; }
             .trend-overview-shell { position: relative; height: 64px; overflow: hidden; background: var(--muted-bg); border: 1px solid var(--border); border-radius: 6px; touch-action: pan-y; }
             .trend-overview { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .78; }
+            .trend-overview-tick { stroke: var(--muted); stroke-width: 1; opacity: .55; vector-effect: non-scaling-stroke; }
             .trend-overview-selection { position: absolute; top: 0; bottom: 0; min-width: 2px; box-sizing: border-box; pointer-events: none; background: #0969da22; background: color-mix(in srgb, var(--accent) 16%, transparent); border-inline: 2px solid var(--accent); }
+            .trend-overview-ticks { position: relative; height: 17px; margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 14px; }
+            .trend-overview-tick-label { position: absolute; top: 0; max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
             .trend-range { position: absolute; inset: 0; width: 100%; height: 64px; margin: 0; padding: 0; appearance: none; -webkit-appearance: none; background: transparent; pointer-events: none; }
             .trend-range::-webkit-slider-runnable-track { height: 64px; background: transparent; }
             .trend-range::-webkit-slider-thumb { width: 16px; height: 64px; margin-top: 0; appearance: none; -webkit-appearance: none; pointer-events: auto; cursor: ew-resize; background: var(--panel-bg); border: 2px solid var(--border); border-radius: 3px; box-shadow: 0 0 0 1px #0002; }
@@ -3950,6 +4049,7 @@
             formatRateLimitChange,
             isTokenAuthenticationError,
             lineChartMarkup,
+            recentMonthsStartIndex,
             normalizeRestComment,
             normalizeRestReview,
             percentage,

@@ -34,6 +34,7 @@ assert.match(userscriptSource, /id="snapshot" class="snapshot-strip"/);
 assert.match(userscriptSource, /pullRequestTrend: buildPullRequestTrend/);
 assert.match(userscriptSource, /data-trend-range="start"/);
 assert.match(userscriptSource, /range\.addEventListener\("input"/);
+assert.match(userscriptSource, /scheduleMainRender\(\)/);
 assert.match(userscriptSource, /dateInput\.addEventListener\("change"/);
 assert.match(userscriptSource, /本地筛选，不调用 API/);
 assert.match(userscriptSource, /ui\.panel\.setAttribute\("aria-busy"/);
@@ -256,6 +257,7 @@ assert.deepEqual(
     prTrend.series.map((series) => series.tone),
     ["green", "purple", "red"],
 );
+assert.equal(prTrend.series.every((series) => !series.dash), true);
 assert.match(prTrend.note, /每日收盘状态/);
 assert.deepEqual(
     stats.buildPullRequestTrend(
@@ -303,16 +305,24 @@ assert.match(lineMarkup, /本地筛选，不调用 API/);
 assert.doesNotMatch(lineMarkup, /line-grid/);
 assert.equal((lineMarkup.match(/<polyline/g) || []).length, 6);
 assert.doesNotMatch(lineMarkup, /line-path line-reference/);
-for (const dash of ["10 4", "3 4"]) {
-    assert.match(lineMarkup, new RegExp(`stroke-dasharray:${dash}`));
-}
+assert.doesNotMatch(lineMarkup, /stroke-dasharray:(?:10 4|3 4)/);
 for (const tone of ["green", "purple", "red"]) {
     assert.match(lineMarkup, new RegExp(`var\\(--chart-${tone}\\)`));
 }
 assert.match(lineMarkup, />2026-01-02<\/text>/);
 assert.match(lineMarkup, />日期（每日）<\/text>/);
 assert.match(lineMarkup, />PR 数量<\/text>/);
+assert.match(lineMarkup, /class="trend-overview-tick"/);
+assert.match(lineMarkup, /class="trend-overview-tick-label"/);
 assert.doesNotMatch(lineMarkup, /NaN|Infinity/);
+assert.equal((lineMarkup.match(/<circle/g) || []).length, 0);
+assert.equal(
+    stats.recentMonthsStartIndex(
+        ["2026-05-31", "2026-06-30", "2026-07-31", "2026-08-31"],
+        2,
+    ),
+    1,
+);
 
 const detailedAxisMarkup = stats.lineChartMarkup(
     "详细坐标轴",
@@ -361,9 +371,8 @@ assert.equal(
 assert.doesNotMatch(longDailyMarkup, /max-width:none/);
 assert.match(
     longDailyMarkup,
-    /保留全部 181 个每日数据点，已隐藏圆点标记以减少渲染/,
+    /181 个每日数据点，未绘制圆点节点/,
 );
-assert.equal((lineMarkup.match(/<circle/g) || []).length, 6);
 
 async function testSeparatedLocalAnalysis() {
     const progress = [];
