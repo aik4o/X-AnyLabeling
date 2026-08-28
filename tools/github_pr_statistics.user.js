@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.26
+// @version      0.6.27
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.26";
+    const SCRIPT_VERSION = "0.6.27";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -37,7 +37,9 @@
     const GRAPHQL_WATCHDOG_MS = 15000;
     const GRAPHQL_HEARTBEAT_MS = 10000;
     const ACTIVE_CONTRIBUTOR_PR_THRESHOLD = 3;
+    const ACTIVE_CONTRIBUTOR_COMMIT_THRESHOLD = 10;
     const CORE_CONTRIBUTOR_PR_THRESHOLD = 10;
+    const CORE_CONTRIBUTOR_COMMIT_THRESHOLD = 50;
     const CHART_COLORS = Object.freeze({
         blue: "var(--chart-blue)",
         green: "var(--chart-green)",
@@ -702,6 +704,7 @@
                     commentCount: 0,
                     reviewCount: 0,
                     commitCount: 0,
+                    commitActivity: [],
                     codeContributor: false,
                 });
             }
@@ -783,13 +786,19 @@
             row.codeContributor = true;
             row.commitCount += Number(entry.total) || 0;
             for (const week of entry.weeks || []) {
-                if (week.c) {
+                const commitCount = Number(week.c) || 0;
+                if (commitCount > 0) {
+                    const at = new Date(week.w * 1000).toISOString();
                     activity(
                         login,
                         "",
-                        new Date(week.w * 1000).toISOString(),
+                        at,
                         "commit",
                     );
+                    row.commitActivity.push({
+                        date: at.slice(0, 10),
+                        count: commitCount,
+                    });
                 }
             }
         }
@@ -808,11 +817,13 @@
             const active =
                 !bot &&
                 active30 &&
-                row.prCount > ACTIVE_CONTRIBUTOR_PR_THRESHOLD;
+                (row.commitCount > ACTIVE_CONTRIBUTOR_COMMIT_THRESHOLD ||
+                    row.prCount > ACTIVE_CONTRIBUTOR_PR_THRESHOLD);
             const core =
                 !bot &&
                 active30 &&
-                row.prCount > CORE_CONTRIBUTOR_PR_THRESHOLD;
+                (row.commitCount > CORE_CONTRIBUTOR_COMMIT_THRESHOLD ||
+                    row.prCount > CORE_CONTRIBUTOR_PR_THRESHOLD);
             return {
                 ...row,
                 associations: [...row.associations],
@@ -820,6 +831,9 @@
                 activityDays: [...row.activityDays].sort(),
                 codeContributionDays: [...row.codeContributionDays].sort(),
                 prDates: [...row.prDates].sort(),
+                commitActivity: [...row.commitActivity].sort((left, right) =>
+                    left.date.localeCompare(right.date),
+                ),
                 activeMonths: row.activityMonths.size,
                 bot,
                 internal,
@@ -894,7 +908,31 @@
                         ? row.codeContributionDays
                         : row.prDates,
                 );
-                return { prDays, activityDays, codeDays };
+                const commitActivity = (row.commitActivity || [])
+                    .map((entry) => ({
+                        day: toDayNumber(entry.date),
+                        count: Number(entry.count) || 0,
+                    }))
+                    .filter(
+                        (entry) =>
+                            Number.isFinite(entry.day) && entry.count > 0,
+                    )
+                    .sort((left, right) => left.day - right.day);
+                let commitTotal = 0;
+                const commitDays = [];
+                const cumulativeCommits = [];
+                for (const entry of commitActivity) {
+                    commitTotal += entry.count;
+                    commitDays.push(entry.day);
+                    cumulativeCommits.push(commitTotal);
+                }
+                return {
+                    prDays,
+                    activityDays,
+                    codeDays,
+                    commitDays,
+                    cumulativeCommits,
+                };
             })
             .filter((row) => row.codeDays.length);
         if (!contributors.length) return { labels: [], series: [] };
@@ -936,6 +974,12 @@
             for (const contributor of contributors) {
                 if (!upperBound(contributor.codeDays, day)) continue;
                 const prCount = upperBound(contributor.prDays, day);
+                const commitIndex =
+                    upperBound(contributor.commitDays, day) - 1;
+                const commitCount =
+                    commitIndex >= 0
+                        ? contributor.cumulativeCommits[commitIndex]
+                        : 0;
                 const lastActivityIndex =
                     upperBound(contributor.activityDays, day) - 1;
                 const activityAge =
@@ -949,13 +993,15 @@
                 if (active90) d90 += 1;
                 if (
                     active30 &&
-                    prCount > ACTIVE_CONTRIBUTOR_PR_THRESHOLD
+                    (commitCount > ACTIVE_CONTRIBUTOR_COMMIT_THRESHOLD ||
+                        prCount > ACTIVE_CONTRIBUTOR_PR_THRESHOLD)
                 ) {
                     active += 1;
                 }
                 if (
                     active30 &&
-                    prCount > CORE_CONTRIBUTOR_PR_THRESHOLD
+                    (commitCount > CORE_CONTRIBUTOR_COMMIT_THRESHOLD ||
+                        prCount > CORE_CONTRIBUTOR_PR_THRESHOLD)
                 ) {
                     core += 1;
                 }
@@ -989,13 +1035,13 @@
                 },
                 {
                     key: "active",
-                    label: "积极贡献者（PR > 3）",
+                    label: "积极贡献者（Commit > 10 或 PR > 3）",
                     tone: "orange",
                     values: activeValues,
                 },
                 {
                     key: "core",
-                    label: "核心贡献者（PR > 10）",
+                    label: "核心贡献者（Commit > 50 或 PR > 10）",
                     tone: "purple",
                     values: coreValues,
                 },
@@ -4107,7 +4153,7 @@
               <p class="help">
                 主 GraphQL 查询保留 PR/Issue 标题和正文；评论/Review 只请求作者、身份关系、发布时间和修改时间，不请求正文。“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
                 PR 实线按创建日期累计，缺失日期沿用前一天累计值；提交者回复、维护者回复和 stale 显示为当前总数的不同线型水平参考线，图例与文字摘要始终显示数值，不只依赖颜色或悬停。图中不显示网格；横坐标每天显示一个完整日期，历史较长时可用键盘、滚动或前后 30 天按钮浏览并默认定位到最新日期，Y 轴会固定在左侧。回复与 stale 是当前分析状态，并非历史快照。stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
-                贡献者仅统计提交过 PR 或出现在 Commit 数据中的代码贡献者，Issue-only 用户不计入。首个贡献者指当前累计仅提交 1 个 PR；D30/D90 指近 30/90 天活跃；积极贡献者指 PR 超过 3 个且 D30 活跃；核心贡献者指 PR 超过 10 个且 D30 活跃。这些条件可重叠，折线按每日收盘状态计算。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
+                贡献者仅统计提交过 PR 或出现在 Commit 数据中的代码贡献者，Issue-only 用户不计入。首个贡献者指当前累计仅提交 1 个 PR；D30/D90 指近 30/90 天活跃；积极贡献者指 D30 活跃，且（Commit 超过 10 个或 PR 超过 3 个）；核心贡献者指 D30 活跃，且（Commit 超过 50 个或 PR 超过 10 个）。这些条件可重叠，折线按每日收盘状态计算。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间和分类门槛精确到周。
                 执行流程严格分为“读取原始数据”和“本地分析”两个阶段；只有读取阶段访问 GitHub API，本地分析每处理 50 条更新一次日志和进度条。点击“暂停”会等待当前 API 请求完成，再保存检查点并停止。
               </p>
             </main>

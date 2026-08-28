@@ -207,6 +207,7 @@ const contributors = stats.buildContributorStatistics(
     [issue],
     commitEntries,
     true,
+    Date.parse("2026-08-28T00:00:00Z"),
 );
 assert.equal(
     contributors.rows.find((row) => row.login === "alice").firstTimeContributor,
@@ -216,6 +217,11 @@ assert.equal(
     contributors.rows.find((row) => row.login === "maintainer").core,
     false,
     "内部身份本身不再等于核心贡献者",
+);
+assert.equal(
+    contributors.rows.find((row) => row.login === "maintainer").active,
+    true,
+    "近期 Commit 超过 10 个时应成为积极贡献者",
 );
 assert.equal(
     contributors.rows.some((row) => row.login === "bob"),
@@ -241,10 +247,17 @@ const classificationPullRequests = [
         reviewComments: [],
     },
 ];
+const classificationCommitWeek =
+    Date.parse("2026-01-15T00:00:00Z") / 1000;
+const classificationCommitEntries = [10, 11, 50, 51].map((total) => ({
+    author: { login: `commit-${total}` },
+    total,
+    weeks: [{ w: classificationCommitWeek, c: total }],
+}));
 const classifiedContributors = stats.buildContributorStatistics(
     classificationPullRequests,
     [],
-    [],
+    classificationCommitEntries,
     true,
     Date.parse("2026-01-20T00:00:00Z"),
 );
@@ -254,16 +267,36 @@ const powerUser = classifiedContributors.rows.find(
 assert.equal(powerUser.prCount, 11);
 assert.equal(powerUser.active, true);
 assert.equal(powerUser.core, true);
-assert.equal(classifiedContributors.active, 1);
-assert.equal(classifiedContributors.core, 1);
+assert.equal(classifiedContributors.active, 4);
+assert.equal(classifiedContributors.core, 2);
 assert.equal(classifiedContributors.firstTime, 1);
-assert.equal(classifiedContributors.active30, 2);
-assert.equal(classifiedContributors.active90, 2);
+assert.equal(classifiedContributors.active30, 6);
+assert.equal(classifiedContributors.active90, 6);
 assert.deepEqual(powerUser.prDates.slice(0, 2), ["2026-01-01", "2026-01-02"]);
+assert.equal(
+    classifiedContributors.rows.find((row) => row.login === "commit-10")
+        .active,
+    false,
+);
+assert.equal(
+    classifiedContributors.rows.find((row) => row.login === "commit-11")
+        .active,
+    true,
+);
+assert.equal(
+    classifiedContributors.rows.find((row) => row.login === "commit-50")
+        .core,
+    false,
+);
+assert.equal(
+    classifiedContributors.rows.find((row) => row.login === "commit-51")
+        .core,
+    true,
+);
 
 const contributorTrend = stats.buildContributorTrend(
     classifiedContributors.rows,
-    "2026-04-12T00:00:00Z",
+    "2026-04-16T00:00:00Z",
     true,
 );
 const contributorTrendValue = (key, date) => {
@@ -286,10 +319,20 @@ assert.equal(contributorTrendValue("active", "2026-01-03"), 0);
 assert.equal(contributorTrendValue("active", "2026-01-04"), 1);
 assert.equal(contributorTrendValue("core", "2026-01-10"), 0);
 assert.equal(contributorTrendValue("core", "2026-01-11"), 1);
+assert.equal(contributorTrendValue("active", "2026-01-15"), 4);
+assert.equal(contributorTrendValue("core", "2026-01-15"), 2);
 assert.equal(contributorTrendValue("first", "2026-01-20"), 1);
-assert.equal(contributorTrendValue("d30", "2026-02-11"), 0);
-assert.equal(contributorTrendValue("d90", "2026-02-11"), 2);
-assert.equal(contributorTrendValue("d90", "2026-04-12"), 0);
+assert.equal(contributorTrendValue("d30", "2026-02-15"), 0);
+assert.equal(contributorTrendValue("d90", "2026-02-11"), 6);
+assert.equal(contributorTrendValue("d90", "2026-04-16"), 0);
+assert.match(
+    contributorTrend.series.find((series) => series.key === "active").label,
+    /Commit > 10 或 PR > 3/,
+);
+assert.match(
+    contributorTrend.series.find((series) => series.key === "core").label,
+    /Commit > 50 或 PR > 10/,
+);
 assert.match(contributorTrend.note, /五类条件可重叠/);
 
 assert.equal(stats.percentage(1, 4), 25);
