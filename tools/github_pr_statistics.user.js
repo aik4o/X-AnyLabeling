@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.9
+// @version      0.6.10
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.9";
+    const SCRIPT_VERSION = "0.6.10";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -42,7 +42,6 @@
         gray: "var(--chart-gray)",
     });
     const DAY_MS = 24 * 60 * 60 * 1000;
-    const HAN_PATTERN = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/u;
     const MAINTAINER_ASSOCIATIONS = new Set([
         "OWNER",
         "MEMBER",
@@ -188,12 +187,6 @@
         GM_deleteValue(CHECKPOINT_KEY);
     }
 
-    function classifyLanguage(title, body) {
-        return HAN_PATTERN.test(`${title || ""}\n${body || ""}`)
-            ? "chinese"
-            : "english";
-    }
-
     function isBot(login) {
         return /\[bot\]$/i.test(login || "");
     }
@@ -321,7 +314,6 @@
             lastEditedAt: pr.lastEditedAt,
             closedAt: pr.closedAt,
             mergedAt: pr.mergedAt,
-            language: classifyLanguage(pr.title, pr.body),
             merged: Boolean(pr.mergedAt),
             open: pr.state === "OPEN",
             closedWithoutMerge: pr.state === "CLOSED" && !pr.mergedAt,
@@ -498,12 +490,6 @@
             selectedScope === "open" ? rows.filter((row) => row.open) : rows;
         return {
             total: groupStatistics(scopedRows),
-            chinese: groupStatistics(
-                scopedRows.filter((row) => row.language === "chinese"),
-            ),
-            english: groupStatistics(
-                scopedRows.filter((row) => row.language === "english"),
-            ),
         };
     }
 
@@ -2224,14 +2210,6 @@
         `;
     }
 
-    function statRows(summary) {
-        return [
-            ["中文", summary.chinese],
-            ["英文", summary.english],
-            ["全部", summary.total],
-        ];
-    }
-
     function render() {
         if (!analysis) return;
         const summary = summarizePullRequests(analysis.rows, scope);
@@ -2247,34 +2225,22 @@
             ? [
                   ["Open PR", total, "key"],
                   [
-                      "中文 Open PR",
-                      countAndRate(summary.chinese.count, total),
-                  ],
-                  [
-                      "英文 Open PR",
-                      countAndRate(summary.english.count, total),
+                      "提交者回复率",
+                      rate(summary.total.submitterReplied, total),
                   ],
                   [
                       "维护者回复率",
                       rate(summary.total.maintainerReplied, total),
                       "key",
                   ],
-                  [
-                      "中文维护者回复率",
-                      rate(
-                          summary.chinese.maintainerReplied,
-                          summary.chinese.count,
-                      ),
-                  ],
-                  [
-                      "英文维护者回复率",
-                      rate(
-                          summary.english.maintainerReplied,
-                          summary.english.count,
-                      ),
-                  ],
                   ["30 天 stale", countAndRate(summary.total.stale30, total)],
                   ["90 天 stale", countAndRate(summary.total.stale90, total)],
+                  [
+                      "首次维护者回复中位数",
+                      formatDuration(
+                          summary.total.medianFirstMaintainerResponseHours,
+                      ),
+                  ],
                   [
                       "维护者最近回复",
                       latestReplyHtml(summary.total.latestMaintainerReply, true),
@@ -2283,23 +2249,7 @@
               ]
             : [
                   ["PR", total, "key"],
-                  [
-                      "中文 PR",
-                      countAndRate(summary.chinese.count, total),
-                  ],
-                  [
-                      "英文 PR",
-                      countAndRate(summary.english.count, total),
-                  ],
                   ["总体合并率", rate(summary.total.merged, total), "key"],
-                  [
-                      "中文合并率",
-                      rate(summary.chinese.merged, summary.chinese.count),
-                  ],
-                  [
-                      "英文合并率",
-                      rate(summary.english.merged, summary.english.count),
-                  ],
                   [
                       "提交者回复率",
                       rate(summary.total.submitterReplied, total),
@@ -2323,56 +2273,6 @@
               ];
 
         ui.cards.innerHTML = cardsMarkup(cards);
-        const languageRows = [
-            [
-                "中文",
-                summary.chinese.count,
-                countAndRate(summary.chinese.count, total),
-                "purple",
-            ],
-            [
-                "英文",
-                summary.english.count,
-                countAndRate(summary.english.count, total),
-                "blue",
-            ],
-        ];
-        const comparisonRows = isOpen
-            ? [
-                  rateRow(
-                      "全部",
-                      summary.total.maintainerReplied,
-                      total,
-                      "green",
-                  ),
-                  rateRow(
-                      "中文",
-                      summary.chinese.maintainerReplied,
-                      summary.chinese.count,
-                      "purple",
-                  ),
-                  rateRow(
-                      "英文",
-                      summary.english.maintainerReplied,
-                      summary.english.count,
-                      "blue",
-                  ),
-              ]
-            : [
-                  rateRow("全部", summary.total.merged, total, "green"),
-                  rateRow(
-                      "中文",
-                      summary.chinese.merged,
-                      summary.chinese.count,
-                      "purple",
-                  ),
-                  rateRow(
-                      "英文",
-                      summary.english.merged,
-                      summary.english.count,
-                      "blue",
-                  ),
-              ];
         const healthRows = [
             rateRow(
                 "提交者回复",
@@ -2389,23 +2289,17 @@
             rateRow("30 天 stale", summary.total.stale30, total, "orange"),
             rateRow("90 天 stale", summary.total.stale90, total, "red"),
         ];
-        ui.prCharts.innerHTML = [
-            donutChartMarkup("语言分布", languageRows),
-            barChartMarkup(
-                isOpen ? "维护者回复率（按语言）" : "合并率（按语言）",
-                comparisonRows,
-            ),
-            barChartMarkup("协作与健康", healthRows),
-        ].join("");
+        ui.prCharts.innerHTML = barChartMarkup("协作与健康", healthRows);
 
         const mergeHeader = isOpen
             ? ""
             : "<th>已合并 / 合并率</th>";
+        const prStats = summary.total;
+        const denominator = prStats.count;
         ui.table.innerHTML = `
             <thead>
               <tr>
-                <th>分类</th>
-                <th>PR 数 / 占比</th>
+                <th>PR 数</th>
                 ${mergeHeader}
                 <th>提交者回复率</th>
                 <th>维护者回复率</th>
@@ -2415,43 +2309,35 @@
               </tr>
             </thead>
             <tbody>
-              ${statRows(summary)
-                  .map(([label, stats]) => {
-                      const denominator = stats.count;
-                      return `
-                        <tr>
-                          <th>${label}</th>
-                          <td>${countAndRate(stats.count, total)}</td>
-                          ${
-                              isOpen
-                                  ? ""
-                                  : `<td>${stats.merged} / ${denominator}（${rate(
-                                        stats.merged,
-                                        denominator,
-                                    )}）</td>`
-                          }
-                          <td>${stats.submitterReplied} / ${denominator}（${rate(
-                              stats.submitterReplied,
+              <tr>
+                <td>${denominator}</td>
+                ${
+                    isOpen
+                        ? ""
+                        : `<td>${prStats.merged} / ${denominator}（${rate(
+                              prStats.merged,
                               denominator,
-                          )}）</td>
-                          <td>${stats.maintainerReplied} / ${denominator}（${rate(
-                              stats.maintainerReplied,
-                              denominator,
-                          )}）</td>
-                          <td>${stats.stale30} / ${denominator}（${rate(
-                              stats.stale30,
-                              denominator,
-                          )}）</td>
-                          <td>${formatDuration(
-                              stats.medianFirstMaintainerResponseHours,
-                          )}</td>
-                          <td class="reply">${latestReplyHtml(
-                              stats.latestMaintainerReply,
-                          )}</td>
-                        </tr>
-                      `;
-                  })
-                  .join("")}
+                          )}）</td>`
+                }
+                <td>${prStats.submitterReplied} / ${denominator}（${rate(
+                    prStats.submitterReplied,
+                    denominator,
+                )}）</td>
+                <td>${prStats.maintainerReplied} / ${denominator}（${rate(
+                    prStats.maintainerReplied,
+                    denominator,
+                )}）</td>
+                <td>${prStats.stale30} / ${denominator}（${rate(
+                    prStats.stale30,
+                    denominator,
+                )}）</td>
+                <td>${formatDuration(
+                    prStats.medianFirstMaintainerResponseHours,
+                )}</td>
+                <td class="reply">${latestReplyHtml(
+                    prStats.latestMaintainerReply,
+                )}</td>
+              </tr>
             </tbody>
         `;
 
@@ -2559,24 +2445,32 @@
                 contributorSummary.firstTime,
             ],
         ]);
-        const contributorStructureRows = [
-            rateRow(
+        const contributorAffiliationRows = [
+            [
                 "外部贡献者",
                 contributorSummary.external,
-                contributorSummary.count,
+                countAndRate(
+                    contributorSummary.external,
+                    contributorSummary.count,
+                ),
                 "blue",
-            ),
+            ],
+            [
+                "内部成员",
+                contributorSummary.internal,
+                countAndRate(
+                    contributorSummary.internal,
+                    contributorSummary.count,
+                ),
+                "green",
+            ],
+        ];
+        const contributorStructureRows = [
             rateRow(
                 "持续外部",
                 contributorSummary.recurringExternal,
                 contributorSummary.count,
                 "purple",
-            ),
-            rateRow(
-                "内部成员",
-                contributorSummary.internal,
-                contributorSummary.count,
-                "green",
             ),
             rateRow(
                 "核心贡献者",
@@ -2612,7 +2506,8 @@
             ),
         ];
         ui.contributorCharts.innerHTML = [
-            barChartMarkup("代码贡献者结构", contributorStructureRows),
+            donutChartMarkup("代码贡献者归属", contributorAffiliationRows),
+            barChartMarkup("代码贡献者角色（可重叠）", contributorStructureRows),
             barChartMarkup("最近活跃", contributorActivityRows),
         ].join("");
         ui.contributorTable.innerHTML = `
@@ -3348,7 +3243,7 @@
                 </p>
               </details>
               <p class="help">
-                中文判定：标题或原始正文任一处含中文。主 GraphQL 查询只请求评论/Review 的作者、身份关系、发布时间和修改时间，不请求正文；“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
+                主 GraphQL 查询保留 PR/Issue 标题和正文；评论/Review 只请求作者、身份关系、发布时间和修改时间，不请求正文。“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
                 stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
                 贡献者仅统计提交过 PR 或出现在 Commit 数据中的代码贡献者，Issue-only 用户不计入。核心贡献者默认指内部成员，或达到 5 个合并 PR、10 次 Review、20 个 Commit 任一阈值。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
                 执行流程严格分为“读取原始数据”和“本地分析”两个阶段；只有读取阶段访问 GitHub API，本地分析每处理 50 条更新一次日志和进度条。点击“暂停”会等待当前 API 请求完成，再保存检查点并停止。
@@ -3542,7 +3437,6 @@
             analyzeRepositoryData,
             barChartMarkup,
             buildContributorStatistics,
-            classifyLanguage,
             donutChartMarkup,
             fetchRepositoryData,
             fetchRateLimits,

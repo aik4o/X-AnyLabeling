@@ -39,6 +39,10 @@ assert.match(
     userscriptSource,
     /lastUsage = fetchedData\.usage;[\s\S]*lastRateLimits = await fetchRateLimits\(token\);[\s\S]*fetchedData\.rateLimits = lastRateLimits;/,
 );
+assert.doesNotMatch(
+    userscriptSource,
+    /HAN_PATTERN|classifyLanguage|summary\.(?:chinese|english)/,
+);
 
 const pr = {
     number: 7,
@@ -87,7 +91,11 @@ const analyzedPr = stats.analyzePullRequest(
     pr,
     Date.parse("2026-03-10T00:00:00Z"),
 );
-assert.equal(analyzedPr.language, "chinese");
+assert.equal("language" in analyzedPr, false);
+assert.deepEqual(
+    Object.keys(stats.summarizePullRequests([analyzedPr], "all")),
+    ["total"],
+);
 assert.equal(analyzedPr.maintainerReplied, true);
 assert.equal(analyzedPr.submitterReplied, true);
 assert.equal(analyzedPr.firstMaintainerResponseHours, 24);
@@ -177,14 +185,14 @@ assert.match(chartMarkup, /width:75\.00%/);
 assert.match(chartMarkup, /维护者 &lt;回复&gt;/);
 assert.match(chartMarkup, /tone-green/);
 
-const donutMarkup = stats.donutChartMarkup("语言分布", [
-    ["中文", 1, "1 / 4（25.00%）", "purple"],
-    ["英文", 3, "3 / 4（75.00%）", "blue"],
+const donutMarkup = stats.donutChartMarkup("代码贡献者归属", [
+    ["外部贡献者", 3, "3 / 4（75.00%）", "blue"],
+    ["内部成员", 1, "1 / 4（25.00%）", "green"],
 ]);
 assert.match(donutMarkup, /class="donut-chart"/);
 assert.match(donutMarkup, /conic-gradient/);
-assert.match(donutMarkup, /25\.00%/);
-assert.match(donutMarkup, /aria-label="语言分布/);
+assert.match(donutMarkup, /75\.00%/);
+assert.match(donutMarkup, /aria-label="代码贡献者归属/);
 
 const lineMarkup = stats.lineChartMarkup("Commit 趋势", [
     ["2026-01", 2],
