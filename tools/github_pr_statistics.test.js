@@ -39,6 +39,11 @@ assert.match(userscriptSource, /navigator\.clipboard\?\.writeText/);
 assert.match(userscriptSource, /const GRAPHQL_WATCHDOG_MS = 15000;/);
 assert.match(userscriptSource, /id="snapshot" class="snapshot-strip"/);
 assert.match(userscriptSource, /pullRequestTrend: buildPullRequestTrend/);
+assert.match(userscriptSource, /id="contributor-trend"/);
+assert.match(
+    userscriptSource,
+    /initializeDailyChart\(ui\.contributorTrend/,
+);
 assert.match(userscriptSource, /data-trend-range="start"/);
 assert.match(userscriptSource, /range\.addEventListener\("input"/);
 assert.match(userscriptSource, /scheduleMainRender\(\)/);
@@ -209,13 +214,83 @@ assert.equal(
 );
 assert.equal(
     contributors.rows.find((row) => row.login === "maintainer").core,
-    true,
+    false,
+    "内部身份本身不再等于核心贡献者",
 );
 assert.equal(
     contributors.rows.some((row) => row.login === "bob"),
     false,
     "仅提交 Issue 的用户不应计入代码贡献者",
 );
+
+const classificationPullRequests = [
+    ...Array.from({ length: 11 }, (_item, index) => ({
+        author: { login: "power-user" },
+        authorAssociation: "NONE",
+        createdAt: `2026-01-${String(index + 1).padStart(2, "0")}T00:00:00Z`,
+        comments: { nodes: [] },
+        reviews: { nodes: [] },
+        reviewComments: [],
+    })),
+    {
+        author: { login: "one-pr-user" },
+        authorAssociation: "NONE",
+        createdAt: "2026-01-05T00:00:00Z",
+        comments: { nodes: [] },
+        reviews: { nodes: [] },
+        reviewComments: [],
+    },
+];
+const classifiedContributors = stats.buildContributorStatistics(
+    classificationPullRequests,
+    [],
+    [],
+    true,
+    Date.parse("2026-01-20T00:00:00Z"),
+);
+const powerUser = classifiedContributors.rows.find(
+    (row) => row.login === "power-user",
+);
+assert.equal(powerUser.prCount, 11);
+assert.equal(powerUser.active, true);
+assert.equal(powerUser.core, true);
+assert.equal(classifiedContributors.active, 1);
+assert.equal(classifiedContributors.core, 1);
+assert.equal(classifiedContributors.firstTime, 1);
+assert.equal(classifiedContributors.active30, 2);
+assert.equal(classifiedContributors.active90, 2);
+assert.deepEqual(powerUser.prDates.slice(0, 2), ["2026-01-01", "2026-01-02"]);
+
+const contributorTrend = stats.buildContributorTrend(
+    classifiedContributors.rows,
+    "2026-04-12T00:00:00Z",
+    true,
+);
+const contributorTrendValue = (key, date) => {
+    const dateIndex = contributorTrend.labels.indexOf(date);
+    assert.notEqual(dateIndex, -1);
+    return contributorTrend.series.find((series) => series.key === key).values[
+        dateIndex
+    ];
+};
+assert.deepEqual(
+    contributorTrend.series.map((series) => series.key),
+    ["first", "d30", "d90", "active", "core"],
+);
+assert.deepEqual(
+    contributorTrend.series.map((series) => series.tone),
+    ["gray", "green", "blue", "orange", "purple"],
+);
+assert.equal(contributorTrend.series.every((series) => !series.dash), true);
+assert.equal(contributorTrendValue("active", "2026-01-03"), 0);
+assert.equal(contributorTrendValue("active", "2026-01-04"), 1);
+assert.equal(contributorTrendValue("core", "2026-01-10"), 0);
+assert.equal(contributorTrendValue("core", "2026-01-11"), 1);
+assert.equal(contributorTrendValue("first", "2026-01-20"), 1);
+assert.equal(contributorTrendValue("d30", "2026-02-11"), 0);
+assert.equal(contributorTrendValue("d90", "2026-02-11"), 2);
+assert.equal(contributorTrendValue("d90", "2026-04-12"), 0);
+assert.match(contributorTrend.note, /五类条件可重叠/);
 
 assert.equal(stats.percentage(1, 4), 25);
 assert.equal(stats.percentage(1, 0), 0);

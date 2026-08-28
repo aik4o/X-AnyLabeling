@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.25
+// @version      0.6.26
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.25";
+    const SCRIPT_VERSION = "0.6.26";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -36,6 +36,8 @@
     const GRAPHQL_REQUEST_TIMEOUT_MS = 30000;
     const GRAPHQL_WATCHDOG_MS = 15000;
     const GRAPHQL_HEARTBEAT_MS = 10000;
+    const ACTIVE_CONTRIBUTOR_PR_THRESHOLD = 3;
+    const CORE_CONTRIBUTOR_PR_THRESHOLD = 10;
     const CHART_COLORS = Object.freeze({
         blue: "var(--chart-blue)",
         green: "var(--chart-green)",
@@ -679,6 +681,7 @@
         issues,
         commitEntries,
         fullHistory,
+        now = Date.now(),
     ) {
         const people = new Map();
         const person = (login) => {
@@ -688,6 +691,9 @@
                     login,
                     associations: new Set(),
                     activityMonths: new Set(),
+                    activityDays: new Set(),
+                    codeContributionDays: new Set(),
+                    prDates: [],
                     firstActivityAt: null,
                     lastActivityAt: null,
                     prCount: 0,
@@ -697,7 +703,6 @@
                     reviewCount: 0,
                     commitCount: 0,
                     codeContributor: false,
-                    firstTimeContributorObserved: false,
                 });
             }
             return people.get(login);
@@ -713,6 +718,14 @@
                 row.lastActivityAt = at;
             }
             row.activityMonths.add(at.slice(0, 7));
+            const day = String(at).slice(0, 10);
+            if (/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+                row.activityDays.add(day);
+                if (kind === "pr") row.prDates.push(day);
+                if (kind === "pr" || kind === "commit") {
+                    row.codeContributionDays.add(day);
+                }
+            }
             if (kind === "pr" || kind === "commit") {
                 row.codeContributor = true;
             }
@@ -730,15 +743,6 @@
                 pr.createdAt,
                 "pr",
             );
-            const prAuthor = person(pr.author?.login);
-            if (
-                prAuthor &&
-                ["FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR"].includes(
-                    pr.authorAssociation,
-                )
-            ) {
-                prAuthor.firstTimeContributorObserved = true;
-            }
             if (pr.mergedAt) {
                 const author = person(pr.author?.login);
                 if (author) author.mergedPrCount += 1;
@@ -798,37 +802,42 @@
             const internal = [...row.associations].some((association) =>
                 MAINTAINER_ASSOCIATIONS.has(association),
             );
+            const active30 =
+                Boolean(row.lastActivityAt) &&
+                ageInDays(row.lastActivityAt, now) <= 30;
+            const active =
+                !bot &&
+                active30 &&
+                row.prCount > ACTIVE_CONTRIBUTOR_PR_THRESHOLD;
             const core =
                 !bot &&
-                (internal ||
-                    row.mergedPrCount >= 5 ||
-                    row.reviewCount >= 10 ||
-                    row.commitCount >= 20);
+                active30 &&
+                row.prCount > CORE_CONTRIBUTOR_PR_THRESHOLD;
             return {
                 ...row,
                 associations: [...row.associations],
                 activityMonths: [...row.activityMonths].sort(),
+                activityDays: [...row.activityDays].sort(),
+                codeContributionDays: [...row.codeContributionDays].sort(),
+                prDates: [...row.prDates].sort(),
                 activeMonths: row.activityMonths.size,
                 bot,
                 internal,
                 external: !bot && !internal,
-                firstTimeContributor: fullHistory
-                    ? row.prCount === 1
-                    : row.firstTimeContributorObserved,
+                firstTimeContributor: row.prCount === 1,
                 recurringExternal:
                     !bot &&
                     !internal &&
                     (row.prCount >= 2 || row.activityMonths.size >= 2),
+                active,
                 core,
-                active30:
-                    Boolean(row.lastActivityAt) &&
-                    ageInDays(row.lastActivityAt) <= 30,
+                active30,
                 active90:
                     Boolean(row.lastActivityAt) &&
-                    ageInDays(row.lastActivityAt) <= 90,
+                    ageInDays(row.lastActivityAt, now) <= 90,
                 active365:
                     Boolean(row.lastActivityAt) &&
-                    ageInDays(row.lastActivityAt) <= 365,
+                    ageInDays(row.lastActivityAt, now) <= 365,
             };
         });
         rows.sort((a, b) =>
@@ -847,9 +856,151 @@
                 .length,
             firstTime: humanRows.filter((row) => row.firstTimeContributor)
                 .length,
+            active: humanRows.filter((row) => row.active).length,
             active30: humanRows.filter((row) => row.active30).length,
             active90: humanRows.filter((row) => row.active90).length,
             active365: humanRows.filter((row) => row.active365).length,
+        };
+    }
+
+    function buildContributorTrend(
+        rows,
+        asOf = Date.now(),
+        fullHistory = true,
+    ) {
+        const toDayNumber = (value) => {
+            const day = String(value || "").slice(0, 10);
+            const parsed = /^\d{4}-\d{2}-\d{2}$/.test(day)
+                ? Date.parse(`${day}T00:00:00Z`)
+                : NaN;
+            return Number.isFinite(parsed) ? Math.floor(parsed / DAY_MS) : null;
+        };
+        const normalizeDays = (values) =>
+            (values || [])
+                .map(toDayNumber)
+                .filter(Number.isFinite)
+                .sort((left, right) => left - right);
+        const contributors = (rows || [])
+            .filter((row) => !row.bot)
+            .map((row) => {
+                const prDays = normalizeDays(row.prDates);
+                const activityDays = normalizeDays(
+                    row.activityDays?.length
+                        ? row.activityDays
+                        : [row.lastActivityAt],
+                );
+                const codeDays = normalizeDays(
+                    row.codeContributionDays?.length
+                        ? row.codeContributionDays
+                        : row.prDates,
+                );
+                return { prDays, activityDays, codeDays };
+            })
+            .filter((row) => row.codeDays.length);
+        if (!contributors.length) return { labels: [], series: [] };
+
+        const upperBound = (values, target) => {
+            let low = 0;
+            let high = values.length;
+            while (low < high) {
+                const middle = Math.floor((low + high) / 2);
+                if (values[middle] <= target) low = middle + 1;
+                else high = middle;
+            }
+            return low;
+        };
+        const observedDays = contributors.flatMap((row) => [
+            ...row.activityDays,
+            ...row.codeDays,
+        ]);
+        const startDay = Math.min(...contributors.map((row) => row.codeDays[0]));
+        const parsedAsOf =
+            typeof asOf === "number" ? asOf : Date.parse(String(asOf || ""));
+        const asOfDay = Math.floor(
+            (Number.isFinite(parsedAsOf) ? parsedAsOf : Date.now()) / DAY_MS,
+        );
+        const endDay = Math.max(asOfDay, ...observedDays);
+        const labels = [];
+        const firstValues = [];
+        const d30Values = [];
+        const d90Values = [];
+        const activeValues = [];
+        const coreValues = [];
+        for (let day = startDay; day <= endDay; day += 1) {
+            labels.push(new Date(day * DAY_MS).toISOString().slice(0, 10));
+            let first = 0;
+            let d30 = 0;
+            let d90 = 0;
+            let active = 0;
+            let core = 0;
+            for (const contributor of contributors) {
+                if (!upperBound(contributor.codeDays, day)) continue;
+                const prCount = upperBound(contributor.prDays, day);
+                const lastActivityIndex =
+                    upperBound(contributor.activityDays, day) - 1;
+                const activityAge =
+                    lastActivityIndex >= 0
+                        ? day - contributor.activityDays[lastActivityIndex]
+                        : Infinity;
+                const active30 = activityAge <= 30;
+                const active90 = activityAge <= 90;
+                if (prCount === 1) first += 1;
+                if (active30) d30 += 1;
+                if (active90) d90 += 1;
+                if (
+                    active30 &&
+                    prCount > ACTIVE_CONTRIBUTOR_PR_THRESHOLD
+                ) {
+                    active += 1;
+                }
+                if (
+                    active30 &&
+                    prCount > CORE_CONTRIBUTOR_PR_THRESHOLD
+                ) {
+                    core += 1;
+                }
+            }
+            firstValues.push(first);
+            d30Values.push(d30);
+            d90Values.push(d90);
+            activeValues.push(active);
+            coreValues.push(core);
+        }
+        return {
+            labels,
+            series: [
+                {
+                    key: "first",
+                    label: "首个贡献者（仅 1 个 PR）",
+                    tone: "gray",
+                    values: firstValues,
+                },
+                {
+                    key: "d30",
+                    label: "D30 贡献者",
+                    tone: "green",
+                    values: d30Values,
+                },
+                {
+                    key: "d90",
+                    label: "D90 贡献者",
+                    tone: "blue",
+                    values: d90Values,
+                },
+                {
+                    key: "active",
+                    label: "积极贡献者（PR > 3）",
+                    tone: "orange",
+                    values: activeValues,
+                },
+                {
+                    key: "core",
+                    label: "核心贡献者（PR > 10）",
+                    tone: "purple",
+                    values: coreValues,
+                },
+            ],
+            note: `每日收盘快照；D30、D90 按最近活动计算，五类条件可重叠；Commit 活动精确到周。${fullHistory ? "" : "当前仅 Open 数据，历史 PR 数和分类可能不完整。"}`,
         };
     }
 
@@ -1991,6 +2142,7 @@
             issues,
             commitEntries,
             fetchedData.coverage.fullHistory,
+            Date.parse(fetchedData.raw.fetchedAt) || Date.now(),
         );
         await report("贡献者聚合完成；正在汇总 Commit 分布…", 95);
         const commitStats = analyzeCommitContributors(commitEntries);
@@ -2355,7 +2507,7 @@
             };
             rangeMarkup = `
               <div class="trend-range-panel">
-                <div class="trend-range-controls" role="group" aria-label="选择 PR 趋势显示区间">
+                <div class="trend-range-controls" role="group" aria-label="选择趋势显示区间">
                   <label><span>开始日期</span><input type="date" data-trend-date="start" min="${escapeHtml(fullLabels[0])}" max="${escapeHtml(fullLabels.at(-1))}" value="${escapeHtml(fullLabels[startIndex])}"></label>
                   <label><span>结束日期</span><input type="date" data-trend-date="end" min="${escapeHtml(fullLabels[0])}" max="${escapeHtml(fullLabels.at(-1))}" value="${escapeHtml(fullLabels[endIndex])}"></label>
                   <button type="button" class="button" data-trend-reset>全部时间</button>
@@ -2631,8 +2783,9 @@
         if (row.bot) return "机器人";
         const roles = [];
         if (row.core) roles.push("核心");
+        if (row.active) roles.push("积极");
         if (row.internal) roles.push("内部");
-        if (row.firstTimeContributor) roles.push("首次");
+        if (row.firstTimeContributor) roles.push("首个");
         if (row.recurringExternal) roles.push("持续外部");
         else if (row.external) roles.push("外部");
         return roles.join(" / ") || "其他";
@@ -2948,18 +3101,35 @@
         }
 
         const contributorSummary = analysis.contributors;
+        const contributorTrend = buildContributorTrend(
+            contributorSummary.rows,
+            analysis.raw.fetchedAt,
+            analysis.coverage.fullHistory,
+        );
+        initializeDailyChart(ui.contributorTrend, {
+            title: "贡献者分类趋势",
+            labels: contributorTrend.labels,
+            series: contributorTrend.series,
+            yAxisLabel: "贡献者数量",
+            note: `${contributorTrend.note}${
+                analysis.coverage.completeInteractions
+                    ? ""
+                    : "普通评论/Review 仅取预览，互动活跃人数可能偏低。"
+            }`,
+        });
         ui.contributorCards.innerHTML = cardsMarkup([
             ["代码贡献者", contributorSummary.count, "key"],
-            ["近 30 天活跃", contributorSummary.active30, "key"],
-            ["近 90 天活跃", contributorSummary.active90],
+            ["D30 贡献者", contributorSummary.active30, "key"],
+            ["D90 贡献者", contributorSummary.active90],
+            ["积极贡献者", contributorSummary.active],
             ["外部贡献者", contributorSummary.external],
             ["持续外部贡献者", contributorSummary.recurringExternal],
             ["内部成员", contributorSummary.internal],
             ["核心贡献者", contributorSummary.core],
             [
                 analysis.coverage.fullHistory
-                    ? "首次贡献者"
-                    : "Open 中首次贡献者",
+                    ? "首个贡献者"
+                    : "Open 中仅 1 个 PR",
                 contributorSummary.firstTime,
             ],
         ]);
@@ -2985,6 +3155,12 @@
         ];
         const contributorStructureRows = [
             rateRow(
+                "积极贡献者",
+                contributorSummary.active,
+                contributorSummary.count,
+                "orange",
+            ),
+            rateRow(
                 "持续外部",
                 contributorSummary.recurringExternal,
                 contributorSummary.count,
@@ -2994,10 +3170,10 @@
                 "核心贡献者",
                 contributorSummary.core,
                 contributorSummary.count,
-                "orange",
+                "purple",
             ),
             rateRow(
-                analysis.coverage.fullHistory ? "首次贡献者" : "Open 中首次",
+                analysis.coverage.fullHistory ? "首个贡献者" : "Open 中仅 1 个 PR",
                 contributorSummary.firstTime,
                 contributorSummary.count,
                 "gray",
@@ -3278,6 +3454,7 @@
             ui.issueCharts,
             ui.issueTable,
             ui.contributorCards,
+            ui.contributorTrend,
             ui.contributorCharts,
             ui.contributorTable,
             ui.commitCards,
@@ -3559,6 +3736,11 @@
                 pullRequestTrend: buildPullRequestTrend(analysis.rows, scope),
                 issues: analysis.issueRows,
                 contributors: analysis.contributors,
+                contributorTrend: buildContributorTrend(
+                    analysis.contributors.rows,
+                    analysis.raw.fetchedAt,
+                    analysis.coverage.fullHistory,
+                ),
                 commits: analysis.commitStats,
             },
         };
@@ -3890,6 +4072,7 @@
               <section class="section">
                 <h3>贡献者（最近活跃优先，最多显示 25 人）</h3>
                 <div id="contributor-cards" class="cards"></div>
+                <div id="contributor-trend" class="charts"></div>
                 <div id="contributor-charts" class="charts"></div>
                 <details class="table-details"><summary>查看贡献者明细</summary><div class="table-wrap"><table id="contributor-table"></table></div></details>
               </section>
@@ -3924,7 +4107,7 @@
               <p class="help">
                 主 GraphQL 查询保留 PR/Issue 标题和正文；评论/Review 只请求作者、身份关系、发布时间和修改时间，不请求正文。“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
                 PR 实线按创建日期累计，缺失日期沿用前一天累计值；提交者回复、维护者回复和 stale 显示为当前总数的不同线型水平参考线，图例与文字摘要始终显示数值，不只依赖颜色或悬停。图中不显示网格；横坐标每天显示一个完整日期，历史较长时可用键盘、滚动或前后 30 天按钮浏览并默认定位到最新日期，Y 轴会固定在左侧。回复与 stale 是当前分析状态，并非历史快照。stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
-                贡献者仅统计提交过 PR 或出现在 Commit 数据中的代码贡献者，Issue-only 用户不计入。核心贡献者默认指内部成员，或达到 5 个合并 PR、10 次 Review、20 个 Commit 任一阈值。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
+                贡献者仅统计提交过 PR 或出现在 Commit 数据中的代码贡献者，Issue-only 用户不计入。首个贡献者指当前累计仅提交 1 个 PR；D30/D90 指近 30/90 天活跃；积极贡献者指 PR 超过 3 个且 D30 活跃；核心贡献者指 PR 超过 10 个且 D30 活跃。这些条件可重叠，折线按每日收盘状态计算。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
                 执行流程严格分为“读取原始数据”和“本地分析”两个阶段；只有读取阶段访问 GitHub API，本地分析每处理 50 条更新一次日志和进度条。点击“暂停”会等待当前 API 请求完成，再保存检查点并停止。
               </p>
             </main>
@@ -3964,6 +4147,7 @@
             issueCharts: get("#issue-charts"),
             issueTable: get("#issue-table"),
             contributorCards: get("#contributor-cards"),
+            contributorTrend: get("#contributor-trend"),
             contributorCharts: get("#contributor-charts"),
             contributorTable: get("#contributor-table"),
             commitSection: get("#commit-section"),
@@ -4136,6 +4320,7 @@
             analyzeRepositoryData,
             barChartMarkup,
             buildContributorStatistics,
+            buildContributorTrend,
             buildPullRequestTrend,
             donutChartMarkup,
             fetchRepositoryData,
