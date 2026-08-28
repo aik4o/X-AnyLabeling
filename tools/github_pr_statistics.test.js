@@ -194,29 +194,73 @@ assert.match(donutMarkup, /conic-gradient/);
 assert.match(donutMarkup, /75\.00%/);
 assert.match(donutMarkup, /aria-label="代码贡献者归属/);
 
-const lineMarkup = stats.lineChartMarkup("Commit 趋势", [
-    ["2026-01", 2],
-    ["2026-02", 5],
-    ["2026-03", 3],
-]);
-assert.match(lineMarkup, /class="line-chart"/);
-assert.match(lineMarkup, /<polyline/);
-assert.match(lineMarkup, /峰值 2026-02 5 · 最近 2026-03 3/);
-assert.doesNotMatch(lineMarkup, /NaN|Infinity/);
-
-const healthLineMarkup = stats.lineChartMarkup(
-    "协作与健康（%）",
+const prTrend = stats.buildPullRequestTrend(
     [
-        ["提交者回复", 35.71, "5 / 14（35.71%）"],
-        ["维护者回复", 42.86, "6 / 14（42.86%）"],
-        ["30 天 stale", 7.14, "1 / 14（7.14%）"],
-        ["90 天 stale", 0, "0 / 14（0.00%）"],
+        {
+            createdAt: "2026-01-01T00:00:00Z",
+            open: true,
+            submitterReplied: true,
+            maintainerReplied: true,
+            stale30: true,
+            stale90: false,
+        },
+        {
+            createdAt: "2026-01-20T00:00:00Z",
+            open: false,
+            submitterReplied: false,
+            maintainerReplied: true,
+            stale30: false,
+            stale90: false,
+        },
+        {
+            createdAt: "2026-03-01T00:00:00Z",
+            open: true,
+            submitterReplied: true,
+            maintainerReplied: false,
+            stale30: true,
+            stale90: true,
+        },
     ],
-    "blue",
-    100,
+    "all",
 );
-assert.match(healthLineMarkup, />100<\/text>/);
-assert.match(healthLineMarkup, />30 天 stale<\/text>/);
+assert.deepEqual(prTrend.labels, ["2026-01", "2026-02", "2026-03"]);
+assert.deepEqual(prTrend.series[0].values, [2, 0, 1]);
+assert.deepEqual(prTrend.series[1].values, [1, 0, 1]);
+assert.deepEqual(prTrend.series[2].values, [2, 0, 0]);
+assert.deepEqual(prTrend.series[3].values, [1, 0, 1]);
+assert.deepEqual(prTrend.series[4].values, [0, 0, 1]);
+assert.deepEqual(
+    stats.buildPullRequestTrend(
+        [
+            {
+                createdAt: "2026-01-01T00:00:00Z",
+                open: true,
+            },
+            {
+                createdAt: "2026-01-20T00:00:00Z",
+                open: false,
+            },
+        ],
+        "open",
+    ).series[0].values,
+    [1],
+);
+
+const lineMarkup = stats.lineChartMarkup(
+    "PR 月度趋势（按创建月份）",
+    prTrend.labels,
+    prTrend.series,
+    "PR 数量",
+);
+assert.match(lineMarkup, /class="line-chart"/);
+assert.equal((lineMarkup.match(/<polyline/g) || []).length, 5);
+for (const tone of ["blue", "purple", "green", "orange", "red"]) {
+    assert.match(lineMarkup, new RegExp(`tone-${tone}`));
+}
+assert.match(lineMarkup, />2026-02<\/text>/);
+assert.match(lineMarkup, />时间<\/text>/);
+assert.match(lineMarkup, />PR 数量<\/text>/);
+assert.doesNotMatch(lineMarkup, /NaN|Infinity/);
 
 async function testSeparatedLocalAnalysis() {
     const progress = [];

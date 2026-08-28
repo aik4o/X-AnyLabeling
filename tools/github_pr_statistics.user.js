@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.11
+// @version      0.6.12
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.11";
+    const SCRIPT_VERSION = "0.6.12";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -490,6 +490,76 @@
             selectedScope === "open" ? rows.filter((row) => row.open) : rows;
         return {
             total: groupStatistics(scopedRows),
+        };
+    }
+
+    function buildPullRequestTrend(rows, selectedScope) {
+        const scopedRows =
+            selectedScope === "open" ? rows.filter((row) => row.open) : rows;
+        const months = scopedRows
+            .map((row) => String(row.createdAt || "").slice(0, 7))
+            .filter((month) => /^\d{4}-\d{2}$/.test(month))
+            .sort();
+        if (!months.length) return { labels: [], series: [] };
+
+        const labels = [];
+        const cursor = new Date(`${months[0]}-01T00:00:00Z`);
+        const end = new Date(`${months.at(-1)}-01T00:00:00Z`);
+        while (cursor <= end) {
+            labels.push(cursor.toISOString().slice(0, 7));
+            cursor.setUTCMonth(cursor.getUTCMonth() + 1);
+        }
+        const buckets = new Map(
+            labels.map((month) => [
+                month,
+                {
+                    total: 0,
+                    submitterReplied: 0,
+                    maintainerReplied: 0,
+                    stale30: 0,
+                    stale90: 0,
+                },
+            ]),
+        );
+        for (const row of scopedRows) {
+            const bucket = buckets.get(String(row.createdAt || "").slice(0, 7));
+            if (!bucket) continue;
+            bucket.total += 1;
+            if (row.submitterReplied) bucket.submitterReplied += 1;
+            if (row.maintainerReplied) bucket.maintainerReplied += 1;
+            if (row.stale30) bucket.stale30 += 1;
+            if (row.stale90) bucket.stale90 += 1;
+        }
+        const values = (key) => labels.map((month) => buckets.get(month)[key]);
+        return {
+            labels,
+            series: [
+                {
+                    label: selectedScope === "open" ? "Open PR 数" : "PR 数",
+                    tone: "blue",
+                    values: values("total"),
+                },
+                {
+                    label: "提交者回复 PR",
+                    tone: "purple",
+                    values: values("submitterReplied"),
+                },
+                {
+                    label: "维护者回复 PR",
+                    tone: "green",
+                    values: values("maintainerReplied"),
+                },
+                {
+                    label: "30 天 stale PR",
+                    tone: "orange",
+                    values: values("stale30"),
+                },
+                {
+                    label: "90 天 stale PR",
+                    tone: "red",
+                    values: values("stale90"),
+                },
+            ],
         };
     }
 
@@ -2035,57 +2105,54 @@
         `;
     }
 
-    function lineChartMarkup(title, rows, tone = "blue", upperBound = null) {
-        const values = rows.map(([label, value, display = value]) => ({
-            label,
-            value: Math.max(0, Number(value) || 0),
-            display,
+    function lineChartMarkup(title, labels, series, yAxisLabel = "数量") {
+        const safeLabels = labels.map((label) => String(label));
+        const safeSeries = (series || []).map((item) => ({
+            label: item.label,
+            tone: CHART_COLORS[item.tone] ? item.tone : "blue",
+            values: safeLabels.map((_label, index) =>
+                Math.max(0, Number(item.values?.[index]) || 0),
+            ),
         }));
-        if (!values.length) return "";
+        if (!safeLabels.length || !safeSeries.length) return "";
 
-        const left = 34;
-        const right = 312;
-        const top = 10;
-        const bottom = 116;
+        const left = 60;
+        const right = 980;
+        const top = 15;
+        const bottom = 215;
         const height = bottom - top;
-        const maximum =
-            Number.isFinite(upperBound) && upperBound > 0
-                ? upperBound
-                : Math.max(1, ...values.map((item) => item.value));
-        const safeTone = CHART_COLORS[tone] ? tone : "blue";
-        const color = CHART_COLORS[safeTone];
-        const x = (index) =>
-            values.length === 1
-                ? (left + right) / 2
-                : left + ((right - left) * index) / (values.length - 1);
-        const y = (value) => bottom - (height * value) / maximum;
-        const points = values
-            .map(
-                (item, index) =>
-                    `${x(index).toFixed(2)},${y(item.value).toFixed(2)}`,
-            )
-            .join(" ");
-        const peak = values.reduce((best, item) =>
-            item.value > best.value ? item : best,
+        const maximum = Math.max(
+            1,
+            ...safeSeries.flatMap((item) => item.values),
         );
-        const latest = values.at(-1);
+        const x = (index) =>
+            safeLabels.length === 1
+                ? (left + right) / 2
+                : left + ((right - left) * index) / (safeLabels.length - 1);
+        const y = (value) => bottom - (height * value) / maximum;
         const labelIndexes = (
-            values.length <= 6
-                ? values.map((_item, index) => index)
+            safeLabels.length <= 6
+                ? safeLabels.map((_label, index) => index)
                 : [
                       0,
-                      Math.floor((values.length - 1) / 2),
-                      values.length - 1,
+                      Math.floor((safeLabels.length - 1) / 2),
+                      safeLabels.length - 1,
                   ]
         ).filter((value, index, all) => all.indexOf(value) === index);
-        const ariaLabel = `${title}；${values
-            .map((item) => `${item.label} ${item.display}`)
-            .join("，")}`;
+        const ariaLabel = `${title}；${safeSeries
+            .map((item) => item.label)
+            .join("、")}`;
         return `
             <article class="chart-card line-chart-card">
               <h4>${escapeHtml(title)}</h4>
-              <div class="chart-meta">峰值 ${escapeHtml(peak.label)} ${escapeHtml(peak.display)} · 最近 ${escapeHtml(latest.label)} ${escapeHtml(latest.display)}</div>
-              <svg class="line-chart" viewBox="0 0 320 142" role="img" aria-label="${escapeHtml(ariaLabel)}">
+              <div class="line-legend">
+                ${safeSeries
+                    .map(
+                        (item) => `<span><i class="tone-${item.tone}"></i>${escapeHtml(item.label)}</span>`,
+                    )
+                    .join("")}
+              </div>
+              <svg class="line-chart" viewBox="0 0 1000 300" role="img" aria-label="${escapeHtml(ariaLabel)}">
                 ${[maximum, maximum / 2, 0]
                     .map((value, index) => {
                         const gridY = top + (height * index) / 2;
@@ -2095,26 +2162,40 @@
                         return `<line class="line-grid" x1="${left}" y1="${gridY}" x2="${right}" y2="${gridY}"></line><text class="line-axis-label" x="0" y="${gridY + 3}">${label}</text>`;
                     })
                     .join("")}
-                <polygon class="line-area" style="fill:${color}" points="${left},${bottom} ${points} ${right},${bottom}"></polygon>
-                <polyline class="line-path" style="stroke:${color}" points="${points}"></polyline>
-                ${values
-                    .map(
-                        (item, index) => `<circle class="line-point" style="fill:${color}" cx="${x(index).toFixed(2)}" cy="${y(item.value).toFixed(2)}" r="3.5"><title>${escapeHtml(item.label)}：${escapeHtml(item.display)}</title></circle>`,
-                    )
+                ${safeSeries
+                    .map((item, seriesIndex) => {
+                        const color = CHART_COLORS[item.tone];
+                        const points = item.values
+                            .map(
+                                (value, index) =>
+                                    `${x(index).toFixed(2)},${y(value).toFixed(2)}`,
+                            )
+                            .join(" ");
+                        return `
+                          <polyline class="line-path" style="stroke:${color};stroke-width:${seriesIndex === 0 ? 3 : 2}" points="${points}"></polyline>
+                          ${item.values
+                              .map(
+                                  (value, index) => `<circle class="line-point" style="fill:${color}" cx="${x(index).toFixed(2)}" cy="${y(value).toFixed(2)}" r="5"><title>${escapeHtml(item.label)} · ${escapeHtml(safeLabels[index])}：${value}</title></circle>`,
+                              )
+                              .join("")}
+                        `;
+                    })
                     .join("")}
                 ${labelIndexes
                     .map((index) => {
                         const anchor =
-                            values.length === 1
+                            safeLabels.length === 1
                                 ? "middle"
                                 : index === 0
                                   ? "start"
-                                  : index === values.length - 1
+                                  : index === safeLabels.length - 1
                                     ? "end"
                                     : "middle";
-                        return `<text class="line-axis-label" text-anchor="${anchor}" x="${x(index)}" y="138">${escapeHtml(values[index].label)}</text>`;
+                        return `<text class="line-axis-label" text-anchor="${anchor}" x="${x(index)}" y="260">${escapeHtml(safeLabels[index])}</text>`;
                     })
                     .join("")}
+                <text class="line-axis-title" text-anchor="middle" x="520" y="292">时间</text>
+                <text class="line-axis-title" text-anchor="middle" x="-115" y="14" transform="rotate(-90)">${escapeHtml(yAxisLabel)}</text>
               </svg>
             </article>
         `;
@@ -2280,27 +2361,12 @@
               ];
 
         ui.cards.innerHTML = cardsMarkup(cards);
-        const healthRows = [
-            rateRow(
-                "提交者回复",
-                summary.total.submitterReplied,
-                total,
-                "blue",
-            ),
-            rateRow(
-                "维护者回复",
-                summary.total.maintainerReplied,
-                total,
-                "green",
-            ),
-            rateRow("30 天 stale", summary.total.stale30, total, "orange"),
-            rateRow("90 天 stale", summary.total.stale90, total, "red"),
-        ];
+        const prTrend = buildPullRequestTrend(analysis.rows, scope);
         ui.prCharts.innerHTML = lineChartMarkup(
-            "协作与健康（%）",
-            healthRows,
-            "blue",
-            100,
+            "PR 月度趋势（按创建月份）",
+            prTrend.labels,
+            prTrend.series,
+            "PR 数量",
         );
 
         const mergeHeader = isOpen
@@ -2553,11 +2619,14 @@
                     ["Top 5 占比", `${(commits.top5Share * 100).toFixed(2)}%`],
                     ["最近活跃周", formatDate(commits.lastActiveWeek)],
                 ]);
-                const monthlyRows = commits.monthly.map(([month, count]) => [
-                    month,
-                    count,
-                    count,
-                ]);
+                const monthlyLabels = commits.monthly.map(([month]) => month);
+                const monthlySeries = [
+                    {
+                        label: "Commit 数",
+                        tone: "blue",
+                        values: commits.monthly.map(([, count]) => count),
+                    },
+                ];
                 const authorRows = commits.authors
                     .slice(0, 8)
                     .map((row, index) => [
@@ -2567,8 +2636,13 @@
                         ["green", "blue", "purple", "orange"][index % 4],
                     ]);
                 ui.commitCharts.innerHTML = [
-                    monthlyRows.length
-                        ? lineChartMarkup("最近 12 个月 Commit 趋势", monthlyRows)
+                    monthlyLabels.length
+                        ? lineChartMarkup(
+                              "最近 12 个月 Commit 趋势",
+                              monthlyLabels,
+                              monthlySeries,
+                              "Commit 数量",
+                          )
                         : "",
                     authorRows.length
                         ? barChartMarkup(
@@ -3154,13 +3228,16 @@
             .donut-legend-row i { width: 9px; height: 9px; border-radius: 50%; }
             .donut-legend-row span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
             .donut-legend-row strong { font-size: 12px; }
-            .chart-meta { margin: -5px 0 4px; color: var(--muted); font-size: 11px; }
+            .line-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: -4px 0 6px; color: var(--muted); font-size: 11px; }
+            .line-legend span { display: inline-flex; align-items: center; gap: 5px; }
+            .line-legend i { width: 9px; height: 9px; border-radius: 50%; }
+            .line-chart-card { grid-column: 1 / -1; }
             .line-chart { display: block; width: 100%; height: auto; overflow: visible; }
             .line-grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
-            .line-area { opacity: .12; }
             .line-path { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
             .line-point { stroke: var(--panel-bg); stroke-width: 2; vector-effect: non-scaling-stroke; }
-            .line-axis-label { fill: var(--muted); font: 9px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+            .line-axis-label { fill: var(--muted); font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+            .line-axis-title { fill: var(--text); font: 600 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
             .table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
             table { width: 100%; border-collapse: collapse; white-space: nowrap; }
             th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
@@ -3256,7 +3333,7 @@
               </details>
               <p class="help">
                 主 GraphQL 查询保留 PR/Issue 标题和正文；评论/Review 只请求作者、身份关系、发布时间和修改时间，不请求正文。“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
-                stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
+                PR 趋势按创建月份分组；回复与 stale 曲线表示该月份创建的 PR 在当前分析时的状态，并非历史快照。stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
                 贡献者仅统计提交过 PR 或出现在 Commit 数据中的代码贡献者，Issue-only 用户不计入。核心贡献者默认指内部成员，或达到 5 个合并 PR、10 次 Review、20 个 Commit 任一阈值。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
                 执行流程严格分为“读取原始数据”和“本地分析”两个阶段；只有读取阶段访问 GitHub API，本地分析每处理 50 条更新一次日志和进度条。点击“暂停”会等待当前 API 请求完成，再保存检查点并停止。
               </p>
@@ -3449,6 +3526,7 @@
             analyzeRepositoryData,
             barChartMarkup,
             buildContributorStatistics,
+            buildPullRequestTrend,
             donutChartMarkup,
             fetchRepositoryData,
             fetchRateLimits,
