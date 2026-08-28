@@ -32,6 +32,10 @@ assert.match(userscriptSource, /id="status" role="status" aria-live="polite"/);
 assert.match(userscriptSource, /id="log" role="log" aria-live="off"/);
 assert.match(userscriptSource, /id="snapshot" class="snapshot-strip"/);
 assert.match(userscriptSource, /pullRequestTrend: buildPullRequestTrend/);
+assert.match(userscriptSource, /data-trend-range="start"/);
+assert.match(userscriptSource, /range\.addEventListener\("input"/);
+assert.match(userscriptSource, /dateInput\.addEventListener\("change"/);
+assert.match(userscriptSource, /本地筛选，不调用 API/);
 assert.match(userscriptSource, /ui\.panel\.setAttribute\("aria-busy"/);
 assert.match(
     userscriptSource,
@@ -205,38 +209,31 @@ const prTrend = stats.buildPullRequestTrend(
         {
             createdAt: "2026-01-01T00:00:00Z",
             open: true,
-            submitterReplied: true,
-            maintainerReplied: true,
-            stale30: true,
-            stale90: false,
         },
         {
             createdAt: "2026-01-01T12:00:00Z",
             open: false,
-            submitterReplied: false,
-            maintainerReplied: true,
-            stale30: false,
-            stale90: false,
+            mergedAt: "2026-01-02T00:00:00Z",
+            merged: true,
         },
         {
-            createdAt: "2026-01-03T00:00:00Z",
-            open: true,
-            submitterReplied: true,
-            maintainerReplied: false,
-            stale30: true,
-            stale90: true,
+            createdAt: "2026-01-01T18:00:00Z",
+            open: false,
+            closedAt: "2026-01-03T00:00:00Z",
+            closedWithoutMerge: true,
         },
     ],
     "all",
 );
 assert.deepEqual(prTrend.labels, ["2026-01-01", "2026-01-02", "2026-01-03"]);
-assert.deepEqual(prTrend.series[0].values, [2, 2, 3]);
-assert.deepEqual(prTrend.series[1].values, [2, 2, 2]);
-assert.deepEqual(prTrend.series[2].values, [2, 2, 2]);
-assert.deepEqual(prTrend.series[3].values, [2, 2, 2]);
-assert.deepEqual(prTrend.series[4].values, [1, 1, 1]);
-assert.equal(prTrend.series[0].reference, undefined);
-assert.equal(prTrend.series.slice(1).every((series) => series.reference), true);
+assert.deepEqual(prTrend.series[0].values, [3, 2, 1]);
+assert.deepEqual(prTrend.series[1].values, [0, 1, 1]);
+assert.deepEqual(prTrend.series[2].values, [0, 0, 1]);
+assert.deepEqual(
+    prTrend.series.map((series) => series.tone),
+    ["green", "purple", "red"],
+);
+assert.match(prTrend.note, /每日收盘状态/);
 assert.deepEqual(
     stats.buildPullRequestTrend(
         [
@@ -250,31 +247,43 @@ assert.deepEqual(
             },
         ],
         "open",
-    ).series[0].values,
-    [1],
+    ).series.map((series) => series.values),
+    [[1], [0], [0]],
 );
 
 const lineMarkup = stats.lineChartMarkup(
-    "PR 累计趋势与当前统计横线（按创建日期）",
-    prTrend.labels,
-    prTrend.series,
+    "Pull Request 状态趋势",
+    prTrend.labels.slice(1),
+    prTrend.series.map((series) => ({
+        ...series,
+        values: series.values.slice(1),
+    })),
     "PR 数量",
     true,
+    {
+        fullLabels: prTrend.labels,
+        fullSeries: prTrend.series,
+        startIndex: 1,
+        endIndex: 2,
+        note: prTrend.note,
+    },
 );
 assert.match(lineMarkup, /class="line-chart"/);
 assert.match(lineMarkup, /data-daily-axis="true"/);
-assert.match(lineMarkup, /class="line-y-axis-sticky"/);
 assert.match(lineMarkup, /class="chart-summary"/);
-assert.match(lineMarkup, /data-scroll-days="-30"/);
-assert.match(lineMarkup, /tabindex="0" role="region"/);
 assert.match(lineMarkup, /class="line-legend-key"/);
+assert.match(lineMarkup, /class="trend-range-panel"/);
+assert.match(lineMarkup, /data-trend-date="start"/);
+assert.match(lineMarkup, /data-trend-range="end"/);
+assert.match(lineMarkup, /data-trend-reset/);
+assert.match(lineMarkup, /本地筛选，不调用 API/);
 assert.doesNotMatch(lineMarkup, /line-grid/);
-assert.equal((lineMarkup.match(/<polyline/g) || []).length, 1);
-assert.equal((lineMarkup.match(/line-path line-reference/g) || []).length, 4);
-for (const dash of ["12 5", "3 4", "12 4 3 4", "1 5"]) {
+assert.equal((lineMarkup.match(/<polyline/g) || []).length, 6);
+assert.doesNotMatch(lineMarkup, /line-path line-reference/);
+for (const dash of ["10 4", "3 4"]) {
     assert.match(lineMarkup, new RegExp(`stroke-dasharray:${dash}`));
 }
-for (const tone of ["blue", "purple", "green", "orange", "red"]) {
+for (const tone of ["green", "purple", "red"]) {
     assert.match(lineMarkup, new RegExp(`var\\(--chart-${tone}\\)`));
 }
 assert.match(lineMarkup, />2026-01-02<\/text>/);
@@ -324,14 +333,14 @@ const longDailyMarkup = stats.lineChartMarkup(
 assert.equal((longDailyMarkup.match(/<circle/g) || []).length, 0);
 assert.equal(
     (longDailyMarkup.match(/line-axis-label line-x-label/g) || []).length,
-    181,
+    8,
 );
-assert.match(longDailyMarkup, /style="width:5840px;max-width:none"/);
+assert.doesNotMatch(longDailyMarkup, /max-width:none/);
 assert.match(
     longDailyMarkup,
-    /保留全部 181 个时间点，已隐藏圆点标记以减少渲染/,
+    /保留全部 181 个每日数据点，已隐藏圆点标记以减少渲染/,
 );
-assert.equal((lineMarkup.match(/<circle/g) || []).length, 3);
+assert.equal((lineMarkup.match(/<circle/g) || []).length, 6);
 
 async function testSeparatedLocalAnalysis() {
     const progress = [];

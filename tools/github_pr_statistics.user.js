@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.19
+// @version      0.6.20
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.19";
+    const SCRIPT_VERSION = "0.6.20";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -506,7 +506,8 @@
         const scopedRows =
             selectedScope === "open" ? rows.filter((row) => row.open) : rows;
         const dates = scopedRows
-            .map((row) => String(row.createdAt || "").slice(0, 10))
+            .flatMap((row) => [row.createdAt, row.mergedAt, row.closedAt])
+            .map((value) => String(value || "").slice(0, 10))
             .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date))
             .sort();
         if (!dates.length) return { labels: [], series: [] };
@@ -522,75 +523,71 @@
             labels.map((date) => [
                 date,
                 {
-                    total: 0,
-                    submitterReplied: 0,
-                    maintainerReplied: 0,
-                    stale30: 0,
-                    stale90: 0,
+                    created: 0,
+                    merged: 0,
+                    closed: 0,
                 },
             ]),
         );
         for (const row of scopedRows) {
-            const bucket = buckets.get(
+            const created = buckets.get(
                 String(row.createdAt || "").slice(0, 10),
             );
-            if (!bucket) continue;
-            bucket.total += 1;
-            if (row.submitterReplied) bucket.submitterReplied += 1;
-            if (row.maintainerReplied) bucket.maintainerReplied += 1;
-            if (row.stale30) bucket.stale30 += 1;
-            if (row.stale90) bucket.stale90 += 1;
-        }
-        const cumulativeValues = (key) => {
-            let total = 0;
-            return labels.map((date) => {
-                total += buckets.get(date)[key];
-                return total;
-            });
-        };
-        const horizontalValues = (key) => {
-            const total = labels.reduce(
-                (sum, date) => sum + buckets.get(date)[key],
-                0,
+            if (created) created.created += 1;
+            const merged = buckets.get(
+                String(row.mergedAt || "").slice(0, 10),
             );
-            return labels.map(() => total);
-        };
+            if (merged) merged.merged += 1;
+            if (!row.mergedAt && row.closedWithoutMerge) {
+                const closed = buckets.get(
+                    String(row.closedAt || "").slice(0, 10),
+                );
+                if (closed) closed.closed += 1;
+            }
+        }
+        let open = 0;
+        let merged = 0;
+        let closed = 0;
+        const openValues = [];
+        const mergedValues = [];
+        const closedValues = [];
+        for (const date of labels) {
+            const bucket = buckets.get(date);
+            open = Math.max(
+                0,
+                open + bucket.created - bucket.merged - bucket.closed,
+            );
+            merged += bucket.merged;
+            closed += bucket.closed;
+            openValues.push(open);
+            mergedValues.push(merged);
+            closedValues.push(closed);
+        }
         return {
             labels,
             series: [
                 {
-                    label:
-                        selectedScope === "open"
-                            ? "累计 Open PR 数"
-                            : "累计 PR 数",
-                    tone: "blue",
-                    values: cumulativeValues("total"),
-                },
-                {
-                    label: "提交者回复 PR 总数",
-                    tone: "purple",
-                    reference: true,
-                    values: horizontalValues("submitterReplied"),
-                },
-                {
-                    label: "维护者回复 PR 总数",
+                    label: "Open PR",
                     tone: "green",
-                    reference: true,
-                    values: horizontalValues("maintainerReplied"),
+                    values: openValues,
                 },
                 {
-                    label: "30 天 stale PR 总数",
-                    tone: "orange",
-                    reference: true,
-                    values: horizontalValues("stale30"),
+                    label: "累计 Merge PR",
+                    tone: "purple",
+                    dash: "10 4",
+                    values: mergedValues,
                 },
                 {
-                    label: "90 天 stale PR 总数",
+                    label: "累计 Close PR（未合并）",
                     tone: "red",
-                    reference: true,
-                    values: horizontalValues("stale90"),
+                    dash: "3 4",
+                    values: closedValues,
                 },
             ],
+            note:
+                selectedScope === "open"
+                    ? "当前仅 Open 数据未包含历史 Merge/Close，紫色与红色线为 0。"
+                    : "按创建、合并和未合并关闭日期计算每日收盘状态；未读取 reopen 时间线。",
         };
     }
 
@@ -2148,32 +2145,36 @@
         series,
         yAxisLabel = "数量",
         dailyAxis = false,
+        rangeOptions = null,
     ) {
         const safeLabels = labels.map((label) => String(label));
-        const safeSeries = (series || []).map((item, index) => ({
-            label: item.label,
-            tone: CHART_COLORS[item.tone] ? item.tone : "blue",
-            reference: Boolean(item.reference),
-            dash: item.reference
-                ? REFERENCE_LINE_DASHES[
-                      Math.max(0, index - 1) % REFERENCE_LINE_DASHES.length
-                  ]
-                : "",
-            values: safeLabels.map((_label, index) => {
-                const value = Number(item.values?.[index]);
-                return Number.isFinite(value) ? Math.max(0, value) : 0;
-            }),
-        }));
+        const normalizeSeries = (sourceLabels, sourceSeries) =>
+            (sourceSeries || []).map((item, index) => ({
+                label: item.label,
+                tone: CHART_COLORS[item.tone] ? item.tone : "blue",
+                reference: Boolean(item.reference),
+                dash:
+                    item.dash ||
+                    (item.reference
+                        ? REFERENCE_LINE_DASHES[
+                              Math.max(0, index - 1) %
+                                  REFERENCE_LINE_DASHES.length
+                          ]
+                        : ""),
+                values: sourceLabels.map((_label, valueIndex) => {
+                    const value = Number(item.values?.[valueIndex]);
+                    return Number.isFinite(value) ? Math.max(0, value) : 0;
+                }),
+            }));
+        const safeSeries = normalizeSeries(safeLabels, series);
         if (!safeLabels.length || !safeSeries.length) return "";
 
-        const left = 60;
-        const chartWidth = dailyAxis
-            ? Math.max(1000, left + 20 + (safeLabels.length - 1) * 32)
-            : 1000;
+        const left = 64;
+        const chartWidth = 1000;
         const right = chartWidth - 20;
         const top = 15;
-        const bottom = 215;
-        const chartHeight = dailyAxis ? 330 : 300;
+        const bottom = 220;
+        const chartHeight = 300;
         const height = bottom - top;
         const dataMaximum = Math.max(
             1,
@@ -2202,24 +2203,27 @@
                 ? (left + right) / 2
                 : left + ((right - left) * index) / (safeLabels.length - 1);
         const y = (value) => bottom - (height * value) / maximum;
-        const xTickCount = Math.min(12, safeLabels.length);
-        const labelIndexes = dailyAxis
-            ? safeLabels.map((_label, index) => index)
-            : Array.from({ length: xTickCount }, (_item, index) =>
-                  xTickCount === 1
-                      ? 0
-                      : Math.round(
-                            (index * (safeLabels.length - 1)) /
-                                (xTickCount - 1),
-                        ),
+        const xTickCount = Math.min(
+            dailyAxis ? 8 : 12,
+            safeLabels.length,
+        );
+        const labelIndexes = Array.from(
+            { length: xTickCount },
+            (_item, index) =>
+                xTickCount === 1
+                    ? 0
+                    : Math.round(
+                          (index * (safeLabels.length - 1)) /
+                              (xTickCount - 1),
+                      ),
         ).filter((value, index, all) => all.indexOf(value) === index);
-        const showPoints = safeLabels.length <= 180;
+        const showPoints = safeLabels.length <= 120;
         const densitySummary = showPoints
-            ? `${safeLabels.length} 个时间点`
-            : `保留全部 ${safeLabels.length} 个时间点，已隐藏圆点标记以减少渲染`;
-        const chartSummary = `时间范围 ${safeLabels[0]} 至 ${safeLabels.at(-1)}；${densitySummary}；末期值：${safeSeries
+            ? `${safeLabels.length} 个每日数据点`
+            : `保留全部 ${safeLabels.length} 个每日数据点，已隐藏圆点标记以减少渲染`;
+        const chartSummary = `显示区间 ${safeLabels[0]} 至 ${safeLabels.at(-1)}；${densitySummary}；区间末值：${safeSeries
             .map((item) => `${item.label} ${item.values.at(-1) || 0}`)
-            .join("，")}`;
+            .join("，")}${rangeOptions?.note ? `；${rangeOptions.note}` : ""}`;
         const ariaLabel = `${title}；${chartSummary}`;
         const yAxisMarkup = `
             <line class="line-axis" x1="${left}" y1="${top}" x2="${left}" y2="${bottom}"></line>
@@ -2231,6 +2235,77 @@
                 .join("")}
             <text class="line-axis-title" text-anchor="middle" x="-115" y="14" transform="rotate(-90)">${escapeHtml(yAxisLabel)}</text>
         `;
+        let rangeMarkup = "";
+        if (dailyAxis && rangeOptions?.fullLabels?.length) {
+            const fullLabels = rangeOptions.fullLabels.map((label) =>
+                String(label),
+            );
+            const fullSeries = normalizeSeries(
+                fullLabels,
+                rangeOptions.fullSeries,
+            );
+            const lastIndex = fullLabels.length - 1;
+            const startIndex = Math.max(
+                0,
+                Math.min(lastIndex, Number(rangeOptions.startIndex) || 0),
+            );
+            const endIndex = Math.max(
+                startIndex,
+                Math.min(
+                    lastIndex,
+                    Number.isFinite(Number(rangeOptions.endIndex))
+                        ? Number(rangeOptions.endIndex)
+                        : lastIndex,
+                ),
+            );
+            const denominator = Math.max(1, lastIndex);
+            const startPercent = (100 * startIndex) / denominator;
+            const endPercent =
+                fullLabels.length === 1
+                    ? 100
+                    : (100 * endIndex) / denominator;
+            const overviewTop = 5;
+            const overviewBottom = 59;
+            const overviewMaximum = Math.max(
+                1,
+                ...fullSeries.flatMap((item) => item.values),
+            );
+            const overviewX = (index) =>
+                fullLabels.length === 1
+                    ? 500
+                    : (1000 * index) / lastIndex;
+            const overviewY = (value) =>
+                overviewBottom -
+                ((overviewBottom - overviewTop) * value) / overviewMaximum;
+            rangeMarkup = `
+              <div class="trend-range-panel">
+                <div class="trend-range-controls" role="group" aria-label="选择 PR 趋势显示区间">
+                  <label><span>开始日期</span><input type="date" data-trend-date="start" min="${escapeHtml(fullLabels[0])}" max="${escapeHtml(fullLabels.at(-1))}" value="${escapeHtml(fullLabels[startIndex])}"></label>
+                  <label><span>结束日期</span><input type="date" data-trend-date="end" min="${escapeHtml(fullLabels[0])}" max="${escapeHtml(fullLabels.at(-1))}" value="${escapeHtml(fullLabels[endIndex])}"></label>
+                  <button type="button" class="button" data-trend-reset>全部时间</button>
+                </div>
+                <p class="trend-range-status" data-trend-status aria-live="polite">${escapeHtml(`显示 ${fullLabels[startIndex]} 至 ${fullLabels[endIndex]}，共 ${endIndex - startIndex + 1} 天；本地筛选，不调用 API`)}</p>
+                <div class="trend-overview-shell" role="group" aria-label="拖动两个滑块选择日期范围；也可以使用上方日期输入框">
+                  <svg class="trend-overview" viewBox="0 0 1000 64" preserveAspectRatio="none" aria-hidden="true">
+                    ${fullSeries
+                        .map((item) => {
+                            const points = item.values
+                                .map(
+                                    (value, index) =>
+                                        `${overviewX(index).toFixed(2)},${overviewY(value).toFixed(2)}`,
+                                )
+                                .join(" ");
+                            return `<polyline style="fill:none;stroke:${CHART_COLORS[item.tone]};stroke-width:2;stroke-dasharray:${item.dash || "none"};vector-effect:non-scaling-stroke" points="${points}"></polyline>`;
+                        })
+                        .join("")}
+                  </svg>
+                  <div class="trend-overview-selection" data-trend-selection style="left:${startPercent.toFixed(3)}%;width:${Math.max(0, endPercent - startPercent).toFixed(3)}%" aria-hidden="true"></div>
+                  <input class="trend-range trend-range-start" type="range" data-trend-range="start" min="0" max="${lastIndex}" value="${startIndex}" aria-label="选择开始日期">
+                  <input class="trend-range trend-range-end" type="range" data-trend-range="end" min="0" max="${lastIndex}" value="${endIndex}" aria-label="选择结束日期">
+                </div>
+              </div>
+            `;
+        }
         return `
             <article class="chart-card line-chart-card">
               <h4>${escapeHtml(title)}</h4>
@@ -2243,34 +2318,24 @@
               </div>
               <div class="chart-context">
                 <p class="chart-summary">${escapeHtml(chartSummary)}</p>
-                ${
-                    dailyAxis
-                        ? `<div class="line-chart-nav" aria-label="时间轴浏览"><button type="button" class="button" data-scroll-days="-30">← 较早 30 天</button><button type="button" class="button" data-scroll-days="30">较晚 30 天 →</button></div>`
-                        : ""
-                }
               </div>
-              <div class="line-chart-scroll" data-daily-axis="${dailyAxis}" ${dailyAxis ? `tabindex="0" role="region" aria-label="${escapeHtml(`${title}时间轴；使用左右方向键或前后 30 天按钮浏览`)}"` : ""}>
-              ${dailyAxis ? `<svg class="line-y-axis-sticky" viewBox="0 0 70 ${chartHeight}" aria-hidden="true">${yAxisMarkup}</svg>` : ""}
-              <svg class="line-chart" viewBox="0 0 ${chartWidth} ${chartHeight}" ${dailyAxis ? `style="width:${chartWidth}px;max-width:none"` : ""} role="img" aria-label="${escapeHtml(ariaLabel)}">
-                ${dailyAxis ? "" : yAxisMarkup}
+              <div class="line-chart-scroll" data-daily-axis="${dailyAxis}" role="region" aria-label="${escapeHtml(`${title}；${chartSummary}`)}">
+              <svg class="line-chart" viewBox="0 0 ${chartWidth} ${chartHeight}" role="img" aria-label="${escapeHtml(ariaLabel)}">
+                ${yAxisMarkup}
                 <line class="line-axis" x1="${left}" y1="${bottom}" x2="${right}" y2="${bottom}"></line>
                 ${labelIndexes
                     .map((index) => {
                         const tickX = x(index);
-                        const anchor = dailyAxis
-                            ? "end"
-                            : safeLabels.length === 1
+                        const anchor =
+                            safeLabels.length === 1
                                 ? "middle"
                                 : index === 0
                                   ? "start"
                                   : index === safeLabels.length - 1
                                     ? "end"
                                     : "middle";
-                        const labelY = dailyAxis ? bottom + 16 : 260;
-                        const transform = dailyAxis
-                            ? ` transform="rotate(-60 ${tickX} ${labelY})"`
-                            : "";
-                        return `<line class="line-tick" x1="${tickX}" y1="${bottom}" x2="${tickX}" y2="${bottom + 6}"></line><text class="line-axis-label line-x-label${dailyAxis ? " line-daily-label" : ""}" text-anchor="${anchor}" x="${tickX}" y="${labelY}"${transform}>${escapeHtml(safeLabels[index])}</text>`;
+                        const labelY = dailyAxis ? bottom + 22 : 260;
+                        return `<line class="line-tick" x1="${tickX}" y1="${bottom}" x2="${tickX}" y2="${bottom + 6}"></line><text class="line-axis-label line-x-label${dailyAxis ? " line-daily-label" : ""}" text-anchor="${anchor}" x="${tickX}" y="${labelY}">${escapeHtml(safeLabels[index])}</text>`;
                     })
                     .join("")}
                 ${safeSeries
@@ -2287,7 +2352,7 @@
                             )
                             .join(" ");
                         return `
-                          <polyline class="line-path" style="stroke:${color};stroke-width:${seriesIndex === 0 ? 3 : 2}" points="${points}"></polyline>
+                          <polyline class="line-path" style="stroke:${color};stroke-width:${seriesIndex === 0 ? 3 : 2.5};stroke-dasharray:${item.dash || "none"}" points="${points}"></polyline>
                           ${
                               showPoints
                                   ? item.values
@@ -2300,41 +2365,110 @@
                         `;
                     })
                     .join("")}
-                <text class="line-axis-title" text-anchor="middle" x="${(left + right) / 2}" y="${dailyAxis ? 322 : 292}">${dailyAxis ? "日期（每日）" : "时间"}</text>
+                <text class="line-axis-title" text-anchor="middle" x="${(left + right) / 2}" y="292">${dailyAxis ? "日期（每日）" : "时间"}</text>
               </svg>
               </div>
+              ${rangeMarkup}
             </article>
         `;
     }
 
-    function initializeDailyChart(container) {
-        const scroller = container.querySelector('[data-daily-axis="true"]');
-        if (!scroller) return;
-        const buttons = [
-            ...container.querySelectorAll("[data-scroll-days]"),
-        ];
-        const updateButtons = () => {
-            const maximum = scroller.scrollWidth - scroller.clientWidth;
-            const earlier = buttons.find(
-                (button) => Number(button.dataset.scrollDays) < 0,
-            );
-            const later = buttons.find(
-                (button) => Number(button.dataset.scrollDays) > 0,
-            );
-            if (earlier) earlier.disabled = scroller.scrollLeft <= 1;
-            if (later) later.disabled = scroller.scrollLeft >= maximum - 1;
-        };
-        for (const button of buttons) {
-            button.addEventListener("click", () => {
-                scroller.scrollBy({
-                    left: Number(button.dataset.scrollDays) * 32,
-                    behavior: "auto",
-                });
-            });
+    function initializeDailyChart(container, config) {
+        const labels = config.labels || [];
+        if (!labels.length) {
+            container.innerHTML = "";
+            return;
         }
-        scroller.addEventListener("scroll", updateButtons, { passive: true });
-        scroller.scrollLeft = scroller.scrollWidth;
-        updateButtons();
+        let startIndex = 0;
+        let endIndex = labels.length - 1;
+        const render = () => {
+            const visibleLabels = labels.slice(startIndex, endIndex + 1);
+            const visibleSeries = config.series.map((item) => ({
+                ...item,
+                values: item.values.slice(startIndex, endIndex + 1),
+            }));
+            container.innerHTML = lineChartMarkup(
+                config.title,
+                visibleLabels,
+                visibleSeries,
+                config.yAxisLabel,
+                true,
+                {
+                    fullLabels: labels,
+                    fullSeries: config.series,
+                    startIndex,
+                    endIndex,
+                    note: config.note,
+                },
+            );
+            const startRange = container.querySelector(
+                '[data-trend-range="start"]',
+            );
+            const endRange = container.querySelector(
+                '[data-trend-range="end"]',
+            );
+            const startDate = container.querySelector(
+                '[data-trend-date="start"]',
+            );
+            const endDate = container.querySelector(
+                '[data-trend-date="end"]',
+            );
+            const selection = container.querySelector(
+                "[data-trend-selection]",
+            );
+            const status = container.querySelector("[data-trend-status]");
+            const updatePreview = (changed) => {
+                let nextStart = Number(startRange.value);
+                let nextEnd = Number(endRange.value);
+                if (nextStart > nextEnd) {
+                    if (changed === "start") nextEnd = nextStart;
+                    else nextStart = nextEnd;
+                }
+                startRange.value = String(nextStart);
+                endRange.value = String(nextEnd);
+                startDate.value = labels[nextStart];
+                endDate.value = labels[nextEnd];
+                startIndex = nextStart;
+                endIndex = nextEnd;
+                const denominator = Math.max(1, labels.length - 1);
+                const left = (100 * startIndex) / denominator;
+                const right =
+                    labels.length === 1
+                        ? 100
+                        : (100 * endIndex) / denominator;
+                selection.style.left = `${left}%`;
+                selection.style.width = `${Math.max(0, right - left)}%`;
+                status.textContent = `显示 ${labels[startIndex]} 至 ${labels[endIndex]}，共 ${endIndex - startIndex + 1} 天；本地筛选，不调用 API`;
+            };
+            for (const range of [startRange, endRange]) {
+                range.addEventListener("input", () =>
+                    updatePreview(range.dataset.trendRange),
+                );
+                range.addEventListener("change", render);
+            }
+            for (const dateInput of [startDate, endDate]) {
+                dateInput.addEventListener("change", () => {
+                    const index = labels.indexOf(dateInput.value);
+                    if (index < 0) return;
+                    if (dateInput.dataset.trendDate === "start") {
+                        startIndex = index;
+                        if (startIndex > endIndex) endIndex = startIndex;
+                    } else {
+                        endIndex = index;
+                        if (endIndex < startIndex) startIndex = endIndex;
+                    }
+                    render();
+                });
+            }
+            container
+                .querySelector("[data-trend-reset]")
+                .addEventListener("click", () => {
+                    startIndex = 0;
+                    endIndex = labels.length - 1;
+                    render();
+                });
+        };
+        render();
     }
 
     function contributorRole(row) {
@@ -2509,14 +2643,13 @@
 
         ui.cards.innerHTML = cardsMarkup(cards);
         const prTrend = buildPullRequestTrend(analysis.rows, scope);
-        ui.prCharts.innerHTML = lineChartMarkup(
-            "PR 累计趋势与当前统计横线（按创建日期）",
-            prTrend.labels,
-            prTrend.series,
-            "PR 数量",
-            true,
-        );
-        initializeDailyChart(ui.prCharts);
+        initializeDailyChart(ui.prCharts, {
+            title: "Pull Request 状态趋势",
+            labels: prTrend.labels,
+            series: prTrend.series,
+            yAxisLabel: "PR 数量",
+            note: prTrend.note,
+        });
 
         const mergeHeader = isOpen
             ? ""
@@ -3397,25 +3530,35 @@
             .donut-legend-row i { width: 9px; height: 9px; border-radius: 50%; }
             .donut-legend-row span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
             .donut-legend-row strong { font-size: 12px; }
-            .line-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: -4px 0 6px; color: var(--muted); font-size: 11px; }
-            .line-legend-item { display: inline-flex; align-items: center; gap: 5px; }
+            .line-legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: -2px 0 8px; color: var(--muted); font-size: 12px; }
+            .line-legend-item { display: inline-flex; align-items: center; gap: 6px; }
             .line-legend-key { flex: none; width: 28px; height: 8px; overflow: visible; }
-            .line-legend-item strong { color: var(--text); font-size: 11px; }
+            .line-legend-item strong { color: var(--text); font-size: 12px; }
             .chart-context { display: flex; align-items: center; justify-content: space-between; gap: 8px 14px; flex-wrap: wrap; margin: 5px 0 7px; }
             .chart-summary { flex: 1 1 420px; margin: 0; color: var(--muted); line-height: 1.45; }
-            .line-chart-nav { display: inline-flex; gap: 6px; }
-            .line-chart-nav .button { min-height: 36px; }
             .line-chart-card { grid-column: 1 / -1; }
-            .line-chart-scroll { position: relative; width: 100%; overflow-x: auto; overflow-y: hidden; overscroll-behavior-inline: contain; white-space: nowrap; }
-            .line-chart-scroll > .line-chart { display: inline-block; vertical-align: top; }
-            .line-y-axis-sticky { position: sticky; left: 0; z-index: 1; display: inline-block; width: 70px; height: 330px; margin-right: -70px; vertical-align: top; background: var(--panel-bg); pointer-events: none; }
+            .line-chart-scroll { position: relative; width: 100%; overflow: hidden; }
             .line-chart { display: block; width: 100%; height: auto; overflow: visible; }
             .line-axis, .line-tick { stroke: var(--muted); stroke-width: 1.25; vector-effect: non-scaling-stroke; }
             .line-path { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
             .line-point { stroke: var(--panel-bg); stroke-width: 2; vector-effect: non-scaling-stroke; }
-            .line-axis-label { fill: var(--muted); font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+            .line-axis-label { fill: var(--muted); font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
             .line-daily-label { font-size: 11px; }
-            .line-axis-title { fill: var(--text); font: 600 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+            .line-axis-title { fill: var(--text); font: 600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+            .trend-range-panel { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+            .trend-range-controls { display: flex; align-items: end; gap: 8px; flex-wrap: wrap; }
+            .trend-range-controls label { display: grid; gap: 4px; color: var(--muted); font-size: 11px; }
+            .trend-range-controls input[type="date"] { min-height: 36px; padding: 5px 8px; color: var(--text); color-scheme: light dark; background: var(--panel-bg); border: 1px solid var(--border); border-radius: 6px; }
+            .trend-range-controls .button { min-height: 36px; }
+            .trend-range-status { margin: 7px 0; color: var(--muted); font-size: 11px; }
+            .trend-overview-shell { position: relative; height: 64px; overflow: hidden; background: var(--muted-bg); border: 1px solid var(--border); border-radius: 6px; touch-action: pan-y; }
+            .trend-overview { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .78; }
+            .trend-overview-selection { position: absolute; top: 0; bottom: 0; min-width: 2px; box-sizing: border-box; pointer-events: none; background: #0969da22; background: color-mix(in srgb, var(--accent) 16%, transparent); border-inline: 2px solid var(--accent); }
+            .trend-range { position: absolute; inset: 0; width: 100%; height: 64px; margin: 0; padding: 0; appearance: none; -webkit-appearance: none; background: transparent; pointer-events: none; }
+            .trend-range::-webkit-slider-runnable-track { height: 64px; background: transparent; }
+            .trend-range::-webkit-slider-thumb { width: 16px; height: 64px; margin-top: 0; appearance: none; -webkit-appearance: none; pointer-events: auto; cursor: ew-resize; background: var(--panel-bg); border: 2px solid var(--border); border-radius: 3px; box-shadow: 0 0 0 1px #0002; }
+            .trend-range::-moz-range-track { height: 64px; background: transparent; }
+            .trend-range::-moz-range-thumb { width: 16px; height: 60px; pointer-events: auto; cursor: ew-resize; background: var(--panel-bg); border: 2px solid var(--border); border-radius: 3px; }
             .table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
             table { width: 100%; border-collapse: collapse; white-space: nowrap; }
             th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
@@ -3438,8 +3581,10 @@
               .card.latest { grid-column: span 1; }
               .snapshot-strip { display: grid; grid-template-columns: 1fr; }
               .chart-context { align-items: stretch; }
-              .line-chart-nav { display: grid; grid-template-columns: 1fr 1fr; width: 100%; }
-              .line-chart-nav .button { min-height: 44px; }
+              .trend-range-controls { display: grid; grid-template-columns: 1fr 1fr; align-items: end; }
+              .trend-range-controls label, .trend-range-controls input[type="date"] { width: 100%; box-sizing: border-box; }
+              .trend-range-controls input[type="date"], .trend-range-controls .button { min-height: 44px; }
+              .trend-range-controls .button { grid-column: 1 / -1; }
             }
           </style>
           <button id="launcher" aria-controls="panel" aria-expanded="false" hidden>仓库统计</button>
