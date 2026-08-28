@@ -553,6 +553,36 @@ async function testGraphqlErrorDetails() {
     assert.match(logs[0], /对象上限 100\/页.*互动连接上限 10 条元数据/);
 }
 
+async function testGraphqlWatchdogAbortsHungRequest() {
+    const heartbeats = [];
+    let aborted = false;
+    global.GM_xmlhttpRequest = ({ timeout }) => {
+        assert.equal(timeout, 30000);
+        return {
+            abort() {
+                aborted = true;
+            },
+        };
+    };
+
+    await assert.rejects(
+        stats.requestGraphQL("query", "token", {}, {
+            watchdogMs: 40,
+            heartbeatMs: 10,
+            onHeartbeat: (seconds) => heartbeats.push(seconds),
+        }),
+        (error) => {
+            assert.equal(error.transport, true);
+            assert.equal(error.status, 0);
+            assert.match(error.message, /应用层看门狗超时/);
+            assert.match(error.message, /ApplicationWatchdogTimeout/);
+            return true;
+        },
+    );
+    assert.equal(aborted, true);
+    assert.ok(heartbeats.length >= 1);
+}
+
 async function testGraphqlPauseAndResumeFromCheckpoint() {
     const resetAt = "2026-03-10T01:00:00Z";
     const startingRateLimits = {
@@ -1115,6 +1145,7 @@ async function testRateLimitLookup() {
 testSeparatedLocalAnalysis()
     .then(testAllHistorySplitsPullsAndIssues)
     .then(testGraphqlErrorDetails)
+    .then(testGraphqlWatchdogAbortsHungRequest)
     .then(testGraphqlPauseAndResumeFromCheckpoint)
     .then(testSafeGraphqlPageFallback)
     .then(testGraphqlNetworkErrorDetailsAndRetry)

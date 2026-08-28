@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.18
+// @version      0.6.19
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.18";
+    const SCRIPT_VERSION = "0.6.19";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -33,6 +33,9 @@
     const PAGE_SIZE_STEP = 10;
     const INTERACTION_PREVIEW_SIZE = 10;
     const ANALYSIS_BATCH_SIZE = 50;
+    const GRAPHQL_REQUEST_TIMEOUT_MS = 30000;
+    const GRAPHQL_WATCHDOG_MS = 45000;
+    const GRAPHQL_HEARTBEAT_MS = 10000;
     const CHART_COLORS = Object.freeze({
         blue: "var(--chart-blue)",
         green: "var(--chart-green)",
@@ -1037,9 +1040,52 @@
         return error;
     }
 
-    function requestGraphQL(query, token, variables) {
+    function requestGraphQL(query, token, variables, options = {}) {
         return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
+            const watchdogMs =
+                options.watchdogMs ?? GRAPHQL_WATCHDOG_MS;
+            const heartbeatMs =
+                options.heartbeatMs ?? GRAPHQL_HEARTBEAT_MS;
+            const onHeartbeat = options.onHeartbeat || (() => {});
+            const startedAt = Date.now();
+            let settled = false;
+            let requestHandle = null;
+            let heartbeatTimer = null;
+            const finish = (callback, value) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(watchdogTimer);
+                if (heartbeatTimer !== null) clearInterval(heartbeatTimer);
+                callback(value);
+            };
+            const watchdogTimer = setTimeout(() => {
+                const error = createTransportError(
+                    "GitHub GraphQL",
+                    `应用层看门狗超时（${watchdogMs / 1000} 秒未收到 Tampermonkey 回调）`,
+                    {
+                        status: 0,
+                        statusText: "ApplicationWatchdogTimeout",
+                        readyState: 0,
+                        finalUrl: "https://api.github.com/graphql",
+                    },
+                );
+                finish(reject, error);
+                try {
+                    requestHandle?.abort?.();
+                } catch (_error) {
+                    // 请求已经由看门狗判定失败，底层 abort 失败不影响重试。
+                }
+            }, watchdogMs);
+            if (heartbeatMs > 0) {
+                heartbeatTimer = setInterval(() => {
+                    if (!settled) {
+                        onHeartbeat(
+                            Math.round((Date.now() - startedAt) / 1000),
+                        );
+                    }
+                }, heartbeatMs);
+            }
+            requestHandle = GM_xmlhttpRequest({
                 method: "POST",
                 url: "https://api.github.com/graphql",
                 headers: {
@@ -1049,7 +1095,7 @@
                     "X-GitHub-Api-Version": "2026-03-10",
                 },
                 data: JSON.stringify({ query, variables }),
-                timeout: 30000,
+                timeout: GRAPHQL_REQUEST_TIMEOUT_MS,
                 onload(response) {
                     let payload;
                     try {
@@ -1097,7 +1143,7 @@
                             `GitHub GraphQL 返回非 JSON；${details.join("；")}`,
                         );
                         error.status = response.status;
-                        reject(error);
+                        finish(reject, error);
                         return;
                     }
                     if (response.status !== 200) {
@@ -1109,7 +1155,7 @@
                             ),
                         );
                         error.status = response.status;
-                        reject(error);
+                        finish(reject, error);
                         return;
                     }
                     if (payload.errors?.length) {
@@ -1122,13 +1168,14 @@
                             ),
                         );
                         error.status = response.status;
-                        reject(error);
+                        finish(reject, error);
                         return;
                     }
-                    resolve(payload.data);
+                    finish(resolve, payload.data);
                 },
                 onerror(response) {
-                    reject(
+                    finish(
+                        reject,
                         createTransportError(
                             "GitHub GraphQL",
                             "网络层错误（GM_xmlhttpRequest.onerror）",
@@ -1137,7 +1184,8 @@
                     );
                 },
                 ontimeout(response) {
-                    reject(
+                    finish(
+                        reject,
                         createTransportError(
                             "GitHub GraphQL",
                             "请求超时（GM_xmlhttpRequest.ontimeout）",
@@ -1657,23 +1705,34 @@
                 );
                 const requestStartedAt = Date.now();
                 try {
-                    data = await requestGraphQL(REPOSITORY_QUERY, token, {
-                        owner: repository.owner,
-                        name: repository.name,
-                        prCursor,
-                        issueCursor,
-                        prStates:
-                            selectedScope === "open"
-                                ? ["OPEN"]
-                                : ["OPEN", "CLOSED", "MERGED"],
-                        issueStates:
-                            selectedScope === "open"
-                                ? ["OPEN"]
-                                : ["OPEN", "CLOSED"],
-                        pageSize,
-                        fetchPulls: requestPulls,
-                        fetchIssues: requestIssues,
-                    });
+                    data = await requestGraphQL(
+                        REPOSITORY_QUERY,
+                        token,
+                        {
+                            owner: repository.owner,
+                            name: repository.name,
+                            prCursor,
+                            issueCursor,
+                            prStates:
+                                selectedScope === "open"
+                                    ? ["OPEN"]
+                                    : ["OPEN", "CLOSED", "MERGED"],
+                            issueStates:
+                                selectedScope === "open"
+                                    ? ["OPEN"]
+                                    : ["OPEN", "CLOSED"],
+                            pageSize,
+                            fetchPulls: requestPulls,
+                            fetchIssues: requestIssues,
+                        },
+                        {
+                            onHeartbeat: (elapsedSeconds) =>
+                                onProgress(
+                                    `GraphQL ${requestLabel} 请求仍在进行；已等待 ${elapsedSeconds} 秒；${GRAPHQL_WATCHDOG_MS / 1000} 秒无回调将中止并自动重试`,
+                                    null,
+                                ),
+                        },
+                    );
                     requestSeconds = (
                         (Date.now() - requestStartedAt) /
                         1000
@@ -3679,6 +3738,7 @@
             pullNumberFromUrl,
             rate,
             rateLimitFromHeaders,
+            requestGraphQL,
             summarize,
             summarizeIssues,
             summarizePullRequests,
