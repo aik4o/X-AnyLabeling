@@ -36,6 +36,7 @@ assert.match(
     /ui\.copyLog\.addEventListener\("click", copyFullLog\)/,
 );
 assert.match(userscriptSource, /navigator\.clipboard\?\.writeText/);
+assert.match(userscriptSource, /const GRAPHQL_WATCHDOG_MS = 15000;/);
 assert.match(userscriptSource, /id="snapshot" class="snapshot-strip"/);
 assert.match(userscriptSource, /pullRequestTrend: buildPullRequestTrend/);
 assert.match(userscriptSource, /data-trend-range="start"/);

@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.24
+// @version      0.6.25
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.24";
+    const SCRIPT_VERSION = "0.6.25";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -34,7 +34,7 @@
     const INTERACTION_PREVIEW_SIZE = 10;
     const ANALYSIS_BATCH_SIZE = 50;
     const GRAPHQL_REQUEST_TIMEOUT_MS = 30000;
-    const GRAPHQL_WATCHDOG_MS = 45000;
+    const GRAPHQL_WATCHDOG_MS = 15000;
     const GRAPHQL_HEARTBEAT_MS = 10000;
     const CHART_COLORS = Object.freeze({
         blue: "var(--chart-blue)",
