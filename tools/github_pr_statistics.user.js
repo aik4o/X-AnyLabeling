@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.7
+// @version      0.6.8
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.7";
+    const SCRIPT_VERSION = "0.6.8";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -602,6 +602,7 @@
                     commentCount: 0,
                     reviewCount: 0,
                     commitCount: 0,
+                    codeContributor: false,
                     firstTimeContributorObserved: false,
                 });
             }
@@ -618,6 +619,9 @@
                 row.lastActivityAt = at;
             }
             row.activityMonths.add(at.slice(0, 7));
+            if (kind === "pr" || kind === "commit") {
+                row.codeContributor = true;
+            }
             if (kind === "pr") row.prCount += 1;
             if (kind === "merged_pr") row.mergedPrCount += 1;
             if (kind === "issue") row.issueCount += 1;
@@ -678,6 +682,7 @@
         for (const entry of commitEntries || []) {
             const login = entry.author?.login || "(匿名或已删除账号)";
             const row = person(login);
+            row.codeContributor = true;
             row.commitCount += Number(entry.total) || 0;
             for (const week of entry.weeks || []) {
                 if (week.c) {
@@ -691,7 +696,10 @@
             }
         }
 
-        const rows = [...people.values()].map((row) => {
+        const codeContributors = [...people.values()].filter(
+            (row) => row.codeContributor,
+        );
+        const rows = codeContributors.map((row) => {
             const bot = isBot(row.login);
             const internal = [...row.associations].some((association) =>
                 MAINTAINER_ASSOCIATIONS.has(association),
@@ -2400,7 +2408,7 @@
 
         const contributorSummary = analysis.contributors;
         ui.contributorCards.innerHTML = cardsMarkup([
-            ["贡献者", contributorSummary.count, "key"],
+            ["代码贡献者", contributorSummary.count, "key"],
             ["近 30 天活跃", contributorSummary.active30, "key"],
             ["近 90 天活跃", contributorSummary.active90],
             ["外部贡献者", contributorSummary.external],
@@ -2467,11 +2475,11 @@
             ),
         ];
         ui.contributorCharts.innerHTML = [
-            barChartMarkup("贡献者结构", contributorStructureRows),
+            barChartMarkup("代码贡献者结构", contributorStructureRows),
             barChartMarkup("最近活跃", contributorActivityRows),
         ].join("");
         ui.contributorTable.innerHTML = `
-            <thead><tr><th>贡献者</th><th>最近活跃</th><th>角色</th><th>PR / 合并</th><th>Issue</th><th>评论</th><th>Review</th><th>Commit</th></tr></thead>
+            <thead><tr><th>代码贡献者</th><th>最近活跃</th><th>角色</th><th>PR / 合并</th><th>Issue</th><th>评论</th><th>Review</th><th>Commit</th></tr></thead>
             <tbody>${contributorSummary.rows
                 .slice(0, 25)
                 .map(
@@ -3192,7 +3200,7 @@
               <p class="help">
                 中文判定：标题或原始正文任一处含中文。主 GraphQL 查询只请求评论/Review 的作者、身份关系、发布时间和修改时间，不请求正文；“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
                 stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
-                核心贡献者默认指内部成员，或达到 5 个合并 PR、10 次 Review、20 个 Commit 任一阈值。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
+                贡献者仅统计提交过 PR 或出现在 Commit 数据中的代码贡献者，Issue-only 用户不计入。核心贡献者默认指内部成员，或达到 5 个合并 PR、10 次 Review、20 个 Commit 任一阈值。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
                 执行流程严格分为“读取原始数据”和“本地分析”两个阶段；只有读取阶段访问 GitHub API，本地分析每处理 50 条更新一次日志和进度条。点击“暂停”会等待当前 API 请求完成，再保存检查点并停止。
               </p>
             </main>

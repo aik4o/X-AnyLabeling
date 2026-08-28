@@ -160,6 +160,11 @@ assert.equal(
     contributors.rows.find((row) => row.login === "maintainer").core,
     true,
 );
+assert.equal(
+    contributors.rows.some((row) => row.login === "bob"),
+    false,
+    "仅提交 Issue 的用户不应计入代码贡献者",
+);
 
 assert.equal(stats.percentage(1, 4), 25);
 assert.equal(stats.percentage(1, 0), 0);
