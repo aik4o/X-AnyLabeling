@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.10
+// @version      0.6.11
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.10";
+    const SCRIPT_VERSION = "0.6.11";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -2035,7 +2035,7 @@
         `;
     }
 
-    function lineChartMarkup(title, rows, tone = "blue") {
+    function lineChartMarkup(title, rows, tone = "blue", upperBound = null) {
         const values = rows.map(([label, value, display = value]) => ({
             label,
             value: Math.max(0, Number(value) || 0),
@@ -2048,7 +2048,10 @@
         const top = 10;
         const bottom = 116;
         const height = bottom - top;
-        const maximum = Math.max(1, ...values.map((item) => item.value));
+        const maximum =
+            Number.isFinite(upperBound) && upperBound > 0
+                ? upperBound
+                : Math.max(1, ...values.map((item) => item.value));
         const safeTone = CHART_COLORS[tone] ? tone : "blue";
         const color = CHART_COLORS[safeTone];
         const x = (index) =>
@@ -2066,11 +2069,15 @@
             item.value > best.value ? item : best,
         );
         const latest = values.at(-1);
-        const labelIndexes = [
-            0,
-            Math.floor((values.length - 1) / 2),
-            values.length - 1,
-        ].filter((value, index, all) => all.indexOf(value) === index);
+        const labelIndexes = (
+            values.length <= 6
+                ? values.map((_item, index) => index)
+                : [
+                      0,
+                      Math.floor((values.length - 1) / 2),
+                      values.length - 1,
+                  ]
+        ).filter((value, index, all) => all.indexOf(value) === index);
         const ariaLabel = `${title}；${values
             .map((item) => `${item.label} ${item.display}`)
             .join("，")}`;
@@ -2289,7 +2296,12 @@
             rateRow("30 天 stale", summary.total.stale30, total, "orange"),
             rateRow("90 天 stale", summary.total.stale90, total, "red"),
         ];
-        ui.prCharts.innerHTML = barChartMarkup("协作与健康", healthRows);
+        ui.prCharts.innerHTML = lineChartMarkup(
+            "协作与健康（%）",
+            healthRows,
+            "blue",
+            100,
+        );
 
         const mergeHeader = isOpen
             ? ""

@@ -204,6 +204,20 @@ assert.match(lineMarkup, /<polyline/);
 assert.match(lineMarkup, /峰值 2026-02 5 · 最近 2026-03 3/);
 assert.doesNotMatch(lineMarkup, /NaN|Infinity/);
 
+const healthLineMarkup = stats.lineChartMarkup(
+    "协作与健康（%）",
+    [
+        ["提交者回复", 35.71, "5 / 14（35.71%）"],
+        ["维护者回复", 42.86, "6 / 14（42.86%）"],
+        ["30 天 stale", 7.14, "1 / 14（7.14%）"],
+        ["90 天 stale", 0, "0 / 14（0.00%）"],
+    ],
+    "blue",
+    100,
+);
+assert.match(healthLineMarkup, />100<\/text>/);
+assert.match(healthLineMarkup, />30 天 stale<\/text>/);
+
 async function testSeparatedLocalAnalysis() {
     const progress = [];
     const originalRequest = global.GM_xmlhttpRequest;
