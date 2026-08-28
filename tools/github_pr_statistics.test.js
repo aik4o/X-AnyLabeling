@@ -205,7 +205,7 @@ const prTrend = stats.buildPullRequestTrend(
             stale90: false,
         },
         {
-            createdAt: "2026-01-20T00:00:00Z",
+            createdAt: "2026-01-01T12:00:00Z",
             open: false,
             submitterReplied: false,
             maintainerReplied: true,
@@ -213,7 +213,7 @@ const prTrend = stats.buildPullRequestTrend(
             stale90: false,
         },
         {
-            createdAt: "2026-03-01T00:00:00Z",
+            createdAt: "2026-01-03T00:00:00Z",
             open: true,
             submitterReplied: true,
             maintainerReplied: false,
@@ -223,7 +223,7 @@ const prTrend = stats.buildPullRequestTrend(
     ],
     "all",
 );
-assert.deepEqual(prTrend.labels, ["2026-01", "2026-02", "2026-03"]);
+assert.deepEqual(prTrend.labels, ["2026-01-01", "2026-01-02", "2026-01-03"]);
 assert.deepEqual(prTrend.series[0].values, [2, 0, 1]);
 assert.deepEqual(prTrend.series[1].values, [1, 0, 1]);
 assert.deepEqual(prTrend.series[2].values, [2, 0, 0]);
@@ -237,7 +237,7 @@ assert.deepEqual(
                 open: true,
             },
             {
-                createdAt: "2026-01-20T00:00:00Z",
+                createdAt: "2026-01-01T12:00:00Z",
                 open: false,
             },
         ],
@@ -247,7 +247,7 @@ assert.deepEqual(
 );
 
 const lineMarkup = stats.lineChartMarkup(
-    "PR 月度趋势（按创建月份）",
+    "PR 每日趋势（按创建日期）",
     prTrend.labels,
     prTrend.series,
     "PR 数量",
@@ -257,7 +257,7 @@ assert.equal((lineMarkup.match(/<polyline/g) || []).length, 5);
 for (const tone of ["blue", "purple", "green", "orange", "red"]) {
     assert.match(lineMarkup, new RegExp(`tone-${tone}`));
 }
-assert.match(lineMarkup, />2026-02<\/text>/);
+assert.match(lineMarkup, />2026-01-02<\/text>/);
 assert.match(lineMarkup, />时间<\/text>/);
 assert.match(lineMarkup, />PR 数量<\/text>/);
 assert.doesNotMatch(lineMarkup, /NaN|Infinity/);
@@ -287,6 +287,21 @@ assert.equal(
 for (const tick of [0, 3, 6, 9, 12, 15]) {
     assert.match(detailedAxisMarkup, new RegExp(`>${tick}<\\/text>`));
 }
+
+const longDailyMarkup = stats.lineChartMarkup(
+    "长时间每日趋势",
+    Array.from({ length: 181 }, (_item, index) => `D${index + 1}`),
+    [
+        {
+            label: "PR 数",
+            tone: "blue",
+            values: Array.from({ length: 181 }, () => 1),
+        },
+    ],
+    "PR 数量",
+);
+assert.equal((longDailyMarkup.match(/<circle/g) || []).length, 0);
+assert.equal((lineMarkup.match(/<circle/g) || []).length, 15);
 
 async function testSeparatedLocalAnalysis() {
     const progress = [];

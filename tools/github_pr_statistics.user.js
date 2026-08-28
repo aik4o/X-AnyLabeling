@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.13
+// @version      0.6.14
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.13";
+    const SCRIPT_VERSION = "0.6.14";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -496,22 +496,22 @@
     function buildPullRequestTrend(rows, selectedScope) {
         const scopedRows =
             selectedScope === "open" ? rows.filter((row) => row.open) : rows;
-        const months = scopedRows
-            .map((row) => String(row.createdAt || "").slice(0, 7))
-            .filter((month) => /^\d{4}-\d{2}$/.test(month))
+        const dates = scopedRows
+            .map((row) => String(row.createdAt || "").slice(0, 10))
+            .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date))
             .sort();
-        if (!months.length) return { labels: [], series: [] };
+        if (!dates.length) return { labels: [], series: [] };
 
         const labels = [];
-        const cursor = new Date(`${months[0]}-01T00:00:00Z`);
-        const end = new Date(`${months.at(-1)}-01T00:00:00Z`);
+        const cursor = new Date(`${dates[0]}T00:00:00Z`);
+        const end = new Date(`${dates.at(-1)}T00:00:00Z`);
         while (cursor <= end) {
-            labels.push(cursor.toISOString().slice(0, 7));
-            cursor.setUTCMonth(cursor.getUTCMonth() + 1);
+            labels.push(cursor.toISOString().slice(0, 10));
+            cursor.setUTCDate(cursor.getUTCDate() + 1);
         }
         const buckets = new Map(
-            labels.map((month) => [
-                month,
+            labels.map((date) => [
+                date,
                 {
                     total: 0,
                     submitterReplied: 0,
@@ -522,7 +522,9 @@
             ]),
         );
         for (const row of scopedRows) {
-            const bucket = buckets.get(String(row.createdAt || "").slice(0, 7));
+            const bucket = buckets.get(
+                String(row.createdAt || "").slice(0, 10),
+            );
             if (!bucket) continue;
             bucket.total += 1;
             if (row.submitterReplied) bucket.submitterReplied += 1;
@@ -530,7 +532,7 @@
             if (row.stale30) bucket.stale30 += 1;
             if (row.stale90) bucket.stale90 += 1;
         }
-        const values = (key) => labels.map((month) => buckets.get(month)[key]);
+        const values = (key) => labels.map((date) => buckets.get(date)[key]);
         return {
             labels,
             series: [
@@ -2157,6 +2159,7 @@
                       (index * (safeLabels.length - 1)) / (xTickCount - 1),
                   ),
         ).filter((value, index, all) => all.indexOf(value) === index);
+        const showPoints = safeLabels.length <= 180;
         const ariaLabel = `${title}；${safeSeries
             .map((item) => item.label)
             .join("、")}`;
@@ -2204,11 +2207,15 @@
                             .join(" ");
                         return `
                           <polyline class="line-path" style="stroke:${color};stroke-width:${seriesIndex === 0 ? 3 : 2}" points="${points}"></polyline>
-                          ${item.values
-                              .map(
-                                  (value, index) => `<circle class="line-point" style="fill:${color}" cx="${x(index).toFixed(2)}" cy="${y(value).toFixed(2)}" r="5"><title>${escapeHtml(item.label)} · ${escapeHtml(safeLabels[index])}：${value}</title></circle>`,
-                              )
-                              .join("")}
+                          ${
+                              showPoints
+                                  ? item.values
+                                        .map(
+                                            (value, index) => `<circle class="line-point" style="fill:${color}" cx="${x(index).toFixed(2)}" cy="${y(value).toFixed(2)}" r="5"><title>${escapeHtml(item.label)} · ${escapeHtml(safeLabels[index])}：${value}</title></circle>`,
+                                        )
+                                        .join("")
+                                  : ""
+                          }
                         `;
                     })
                     .join("")}
@@ -2381,7 +2388,7 @@
         ui.cards.innerHTML = cardsMarkup(cards);
         const prTrend = buildPullRequestTrend(analysis.rows, scope);
         ui.prCharts.innerHTML = lineChartMarkup(
-            "PR 月度趋势（按创建月份）",
+            "PR 每日趋势（按创建日期）",
             prTrend.labels,
             prTrend.series,
             "PR 数量",
@@ -3353,7 +3360,7 @@
               </details>
               <p class="help">
                 主 GraphQL 查询保留 PR/Issue 标题和正文；评论/Review 只请求作者、身份关系、发布时间和修改时间，不请求正文。“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
-                PR 趋势按创建月份分组；回复与 stale 曲线表示该月份创建的 PR 在当前分析时的状态，并非历史快照。stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
+                PR 趋势按创建日期分组，缺失日期补 0；回复与 stale 曲线表示该日期创建的 PR 在当前分析时的状态，并非历史快照。stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
                 贡献者仅统计提交过 PR 或出现在 Commit 数据中的代码贡献者，Issue-only 用户不计入。核心贡献者默认指内部成员，或达到 5 个合并 PR、10 次 Review、20 个 Commit 任一阈值。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
                 执行流程严格分为“读取原始数据”和“本地分析”两个阶段；只有读取阶段访问 GitHub API，本地分析每处理 50 条更新一次日志和进度条。点击“暂停”会等待当前 API 请求完成，再保存检查点并停止。
               </p>
