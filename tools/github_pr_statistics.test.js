@@ -177,6 +177,25 @@ assert.match(chartMarkup, /width:75\.00%/);
 assert.match(chartMarkup, /维护者 &lt;回复&gt;/);
 assert.match(chartMarkup, /tone-green/);
 
+const donutMarkup = stats.donutChartMarkup("语言分布", [
+    ["中文", 1, "1 / 4（25.00%）", "purple"],
+    ["英文", 3, "3 / 4（75.00%）", "blue"],
+]);
+assert.match(donutMarkup, /class="donut-chart"/);
+assert.match(donutMarkup, /conic-gradient/);
+assert.match(donutMarkup, /25\.00%/);
+assert.match(donutMarkup, /aria-label="语言分布/);
+
+const lineMarkup = stats.lineChartMarkup("Commit 趋势", [
+    ["2026-01", 2],
+    ["2026-02", 5],
+    ["2026-03", 3],
+]);
+assert.match(lineMarkup, /class="line-chart"/);
+assert.match(lineMarkup, /<polyline/);
+assert.match(lineMarkup, /峰值 2026-02 5 · 最近 2026-03 3/);
+assert.doesNotMatch(lineMarkup, /NaN|Infinity/);
+
 async function testSeparatedLocalAnalysis() {
     const progress = [];
     const originalRequest = global.GM_xmlhttpRequest;

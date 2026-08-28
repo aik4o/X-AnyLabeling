@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.8
+// @version      0.6.9
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.8";
+    const SCRIPT_VERSION = "0.6.9";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -33,6 +33,14 @@
     const PAGE_SIZE_STEP = 10;
     const INTERACTION_PREVIEW_SIZE = 10;
     const ANALYSIS_BATCH_SIZE = 50;
+    const CHART_COLORS = Object.freeze({
+        blue: "var(--chart-blue)",
+        green: "var(--chart-green)",
+        orange: "var(--chart-orange)",
+        purple: "var(--chart-purple)",
+        red: "var(--chart-red)",
+        gray: "var(--chart-gray)",
+    });
     const DAY_MS = 24 * 60 * 60 * 1000;
     const HAN_PATTERN = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/u;
     const MAINTAINER_ASSOCIATIONS = new Set([
@@ -1962,14 +1970,6 @@
 
     function barChartMarkup(title, rows, maximum = 100) {
         const scale = Number.isFinite(maximum) && maximum > 0 ? maximum : 1;
-        const tones = new Set([
-            "blue",
-            "green",
-            "orange",
-            "purple",
-            "red",
-            "gray",
-        ]);
         return `
             <article class="chart-card">
               <h4>${escapeHtml(title)}</h4>
@@ -1985,7 +1985,7 @@
                                     scale,
                             ),
                         );
-                        const safeTone = tones.has(tone) ? tone : "blue";
+                        const safeTone = CHART_COLORS[tone] ? tone : "blue";
                         const ariaLabel = `${label} ${display}`;
                         return `
                           <div class="chart-row" role="img" aria-label="${escapeHtml(ariaLabel)}">
@@ -1996,6 +1996,133 @@
                     })
                     .join("")}
               </div>
+            </article>
+        `;
+    }
+
+    function donutChartMarkup(title, rows) {
+        const items = rows.map(
+            ([label, value, display = value, tone = "blue"]) => ({
+                label,
+                value: Math.max(0, Number(value) || 0),
+                display,
+                tone: CHART_COLORS[tone] ? tone : "blue",
+            }),
+        );
+        const total = items.reduce((sum, item) => sum + item.value, 0);
+        let offset = 0;
+        const positiveItems = items.filter((item) => item.value > 0);
+        const segments = positiveItems.map((item, index) => {
+            const start = offset;
+            offset += (100 * item.value) / total;
+            const end = index === positiveItems.length - 1 ? 100 : offset;
+            return `${CHART_COLORS[item.tone]} ${start.toFixed(2)}% ${end.toFixed(2)}%`;
+        });
+        const background = segments.length
+            ? `conic-gradient(${segments.join(", ")})`
+            : "var(--muted-bg)";
+        const ariaLabel = `${title}；${items
+            .map((item) => `${item.label} ${item.display}`)
+            .join("，")}`;
+        return `
+            <article class="chart-card">
+              <h4>${escapeHtml(title)}</h4>
+              <div class="donut-layout">
+                <div class="donut-chart" role="img" aria-label="${escapeHtml(ariaLabel)}" style="background:${background}">
+                  <div class="donut-total"><strong>${escapeHtml(total)}</strong><span>总计</span></div>
+                </div>
+                <div class="donut-legend">
+                  ${items
+                      .map(
+                          (item) => `
+                            <div class="donut-legend-row">
+                              <i class="tone-${item.tone}"></i>
+                              <span>${escapeHtml(item.label)}</span>
+                              <strong>${escapeHtml(item.display)}</strong>
+                            </div>
+                          `,
+                      )
+                      .join("")}
+                </div>
+              </div>
+            </article>
+        `;
+    }
+
+    function lineChartMarkup(title, rows, tone = "blue") {
+        const values = rows.map(([label, value, display = value]) => ({
+            label,
+            value: Math.max(0, Number(value) || 0),
+            display,
+        }));
+        if (!values.length) return "";
+
+        const left = 34;
+        const right = 312;
+        const top = 10;
+        const bottom = 116;
+        const height = bottom - top;
+        const maximum = Math.max(1, ...values.map((item) => item.value));
+        const safeTone = CHART_COLORS[tone] ? tone : "blue";
+        const color = CHART_COLORS[safeTone];
+        const x = (index) =>
+            values.length === 1
+                ? (left + right) / 2
+                : left + ((right - left) * index) / (values.length - 1);
+        const y = (value) => bottom - (height * value) / maximum;
+        const points = values
+            .map(
+                (item, index) =>
+                    `${x(index).toFixed(2)},${y(item.value).toFixed(2)}`,
+            )
+            .join(" ");
+        const peak = values.reduce((best, item) =>
+            item.value > best.value ? item : best,
+        );
+        const latest = values.at(-1);
+        const labelIndexes = [
+            0,
+            Math.floor((values.length - 1) / 2),
+            values.length - 1,
+        ].filter((value, index, all) => all.indexOf(value) === index);
+        const ariaLabel = `${title}；${values
+            .map((item) => `${item.label} ${item.display}`)
+            .join("，")}`;
+        return `
+            <article class="chart-card line-chart-card">
+              <h4>${escapeHtml(title)}</h4>
+              <div class="chart-meta">峰值 ${escapeHtml(peak.label)} ${escapeHtml(peak.display)} · 最近 ${escapeHtml(latest.label)} ${escapeHtml(latest.display)}</div>
+              <svg class="line-chart" viewBox="0 0 320 142" role="img" aria-label="${escapeHtml(ariaLabel)}">
+                ${[maximum, maximum / 2, 0]
+                    .map((value, index) => {
+                        const gridY = top + (height * index) / 2;
+                        const label = Number.isInteger(value)
+                            ? value
+                            : value.toFixed(1);
+                        return `<line class="line-grid" x1="${left}" y1="${gridY}" x2="${right}" y2="${gridY}"></line><text class="line-axis-label" x="0" y="${gridY + 3}">${label}</text>`;
+                    })
+                    .join("")}
+                <polygon class="line-area" style="fill:${color}" points="${left},${bottom} ${points} ${right},${bottom}"></polygon>
+                <polyline class="line-path" style="stroke:${color}" points="${points}"></polyline>
+                ${values
+                    .map(
+                        (item, index) => `<circle class="line-point" style="fill:${color}" cx="${x(index).toFixed(2)}" cy="${y(item.value).toFixed(2)}" r="3.5"><title>${escapeHtml(item.label)}：${escapeHtml(item.display)}</title></circle>`,
+                    )
+                    .join("")}
+                ${labelIndexes
+                    .map((index) => {
+                        const anchor =
+                            values.length === 1
+                                ? "middle"
+                                : index === 0
+                                  ? "start"
+                                  : index === values.length - 1
+                                    ? "end"
+                                    : "middle";
+                        return `<text class="line-axis-label" text-anchor="${anchor}" x="${x(index)}" y="138">${escapeHtml(values[index].label)}</text>`;
+                    })
+                    .join("")}
+              </svg>
             </article>
         `;
     }
@@ -2197,8 +2324,18 @@
 
         ui.cards.innerHTML = cardsMarkup(cards);
         const languageRows = [
-            rateRow("中文", summary.chinese.count, total, "purple"),
-            rateRow("英文", summary.english.count, total, "blue"),
+            [
+                "中文",
+                summary.chinese.count,
+                countAndRate(summary.chinese.count, total),
+                "purple",
+            ],
+            [
+                "英文",
+                summary.english.count,
+                countAndRate(summary.english.count, total),
+                "blue",
+            ],
         ];
         const comparisonRows = isOpen
             ? [
@@ -2253,7 +2390,7 @@
             rateRow("90 天 stale", summary.total.stale90, total, "red"),
         ];
         ui.prCharts.innerHTML = [
-            barChartMarkup("语言分布", languageRows),
+            donutChartMarkup("语言分布", languageRows),
             barChartMarkup(
                 isOpen ? "维护者回复率（按语言）" : "合并率（按语言）",
                 comparisonRows,
@@ -2509,14 +2646,11 @@
                     ["Top 5 占比", `${(commits.top5Share * 100).toFixed(2)}%`],
                     ["最近活跃周", formatDate(commits.lastActiveWeek)],
                 ]);
-                const monthlyRows = commits.monthly.map(
-                    ([month, count], index) => [
-                        month,
-                        count,
-                        count,
-                        ["blue", "green", "purple"][index % 3],
-                    ],
-                );
+                const monthlyRows = commits.monthly.map(([month, count]) => [
+                    month,
+                    count,
+                    count,
+                ]);
                 const authorRows = commits.authors
                     .slice(0, 8)
                     .map((row, index) => [
@@ -2527,11 +2661,7 @@
                     ]);
                 ui.commitCharts.innerHTML = [
                     monthlyRows.length
-                        ? barChartMarkup(
-                              "最近 12 个月 Commit",
-                              monthlyRows,
-                              Math.max(1, ...monthlyRows.map((row) => row[1])),
-                          )
+                        ? lineChartMarkup("最近 12 个月 Commit 趋势", monthlyRows)
                         : "",
                     authorRows.length
                         ? barChartMarkup(
@@ -3104,6 +3234,26 @@
             .tone-purple { background: var(--chart-purple); }
             .tone-red { background: var(--chart-red); }
             .tone-gray { background: var(--chart-gray); }
+            .donut-layout { display: flex; align-items: center; gap: 18px; min-height: 138px; }
+            .donut-chart { position: relative; flex: 0 0 126px; width: 126px; aspect-ratio: 1; display: grid; place-items: center; border-radius: 50%; }
+            .donut-chart::before { content: ""; position: absolute; inset: 24%; background: var(--panel-bg); border-radius: 50%; }
+            .donut-total { position: relative; z-index: 1; text-align: center; }
+            .donut-total strong, .donut-total span { display: block; }
+            .donut-total strong { font-size: 18px; }
+            .donut-total span { color: var(--muted); font-size: 11px; }
+            .donut-legend { min-width: 0; flex: 1; }
+            .donut-legend-row { display: grid; grid-template-columns: 9px minmax(0, 1fr) auto; align-items: center; gap: 7px; }
+            .donut-legend-row + .donut-legend-row { margin-top: 9px; }
+            .donut-legend-row i { width: 9px; height: 9px; border-radius: 50%; }
+            .donut-legend-row span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+            .donut-legend-row strong { font-size: 12px; }
+            .chart-meta { margin: -5px 0 4px; color: var(--muted); font-size: 11px; }
+            .line-chart { display: block; width: 100%; height: auto; overflow: visible; }
+            .line-grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+            .line-area { opacity: .12; }
+            .line-path { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+            .line-point { stroke: var(--panel-bg); stroke-width: 2; vector-effect: non-scaling-stroke; }
+            .line-axis-label { fill: var(--muted); font: 9px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
             .table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
             table { width: 100%; border-collapse: collapse; white-space: nowrap; }
             th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
@@ -3393,10 +3543,12 @@
             barChartMarkup,
             buildContributorStatistics,
             classifyLanguage,
+            donutChartMarkup,
             fetchRepositoryData,
             fetchRateLimits,
             formatRateLimit,
             formatRateLimitChange,
+            lineChartMarkup,
             normalizeRestComment,
             normalizeRestReview,
             percentage,
