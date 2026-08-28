@@ -251,14 +251,16 @@ const lineMarkup = stats.lineChartMarkup(
     prTrend.labels,
     prTrend.series,
     "PR 数量",
+    true,
 );
 assert.match(lineMarkup, /class="line-chart"/);
+assert.match(lineMarkup, /data-daily-axis="true"/);
 assert.equal((lineMarkup.match(/<polyline/g) || []).length, 5);
 for (const tone of ["blue", "purple", "green", "orange", "red"]) {
     assert.match(lineMarkup, new RegExp(`tone-${tone}`));
 }
 assert.match(lineMarkup, />2026-01-02<\/text>/);
-assert.match(lineMarkup, />时间<\/text>/);
+assert.match(lineMarkup, />日期（每日）<\/text>/);
 assert.match(lineMarkup, />PR 数量<\/text>/);
 assert.doesNotMatch(lineMarkup, /NaN|Infinity/);
 
@@ -299,8 +301,14 @@ const longDailyMarkup = stats.lineChartMarkup(
         },
     ],
     "PR 数量",
+    true,
 );
 assert.equal((longDailyMarkup.match(/<circle/g) || []).length, 0);
+assert.equal(
+    (longDailyMarkup.match(/line-axis-label line-x-label/g) || []).length,
+    181,
+);
+assert.match(longDailyMarkup, /style="width:5840px;max-width:none"/);
 assert.equal((lineMarkup.match(/<circle/g) || []).length, 15);
 
 async function testSeparatedLocalAnalysis() {

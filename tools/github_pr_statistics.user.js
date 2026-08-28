@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.14
+// @version      0.6.15
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.14";
+    const SCRIPT_VERSION = "0.6.15";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -2107,7 +2107,13 @@
         `;
     }
 
-    function lineChartMarkup(title, labels, series, yAxisLabel = "数量") {
+    function lineChartMarkup(
+        title,
+        labels,
+        series,
+        yAxisLabel = "数量",
+        dailyAxis = false,
+    ) {
         const safeLabels = labels.map((label) => String(label));
         const safeSeries = (series || []).map((item) => ({
             label: item.label,
@@ -2120,9 +2126,13 @@
         if (!safeLabels.length || !safeSeries.length) return "";
 
         const left = 60;
-        const right = 980;
+        const chartWidth = dailyAxis
+            ? Math.max(1000, left + 20 + (safeLabels.length - 1) * 32)
+            : 1000;
+        const right = chartWidth - 20;
         const top = 15;
         const bottom = 215;
+        const chartHeight = dailyAxis ? 330 : 300;
         const height = bottom - top;
         const dataMaximum = Math.max(
             1,
@@ -2152,13 +2162,16 @@
                 : left + ((right - left) * index) / (safeLabels.length - 1);
         const y = (value) => bottom - (height * value) / maximum;
         const xTickCount = Math.min(12, safeLabels.length);
-        const labelIndexes = Array.from({ length: xTickCount }, (_item, index) =>
-            xTickCount === 1
-                ? 0
-                : Math.round(
-                      (index * (safeLabels.length - 1)) / (xTickCount - 1),
-                  ),
-        ).filter((value, index, all) => all.indexOf(value) === index);
+        const labelIndexes = dailyAxis
+            ? safeLabels.map((_label, index) => index)
+            : Array.from({ length: xTickCount }, (_item, index) =>
+                  xTickCount === 1
+                      ? 0
+                      : Math.round(
+                            (index * (safeLabels.length - 1)) /
+                                (xTickCount - 1),
+                        ),
+              ).filter((value, index, all) => all.indexOf(value) === index);
         const showPoints = safeLabels.length <= 180;
         const ariaLabel = `${title}；${safeSeries
             .map((item) => item.label)
@@ -2173,7 +2186,8 @@
                     )
                     .join("")}
               </div>
-              <svg class="line-chart" viewBox="0 0 1000 300" role="img" aria-label="${escapeHtml(ariaLabel)}">
+              <div class="line-chart-scroll" data-daily-axis="${dailyAxis}">
+              <svg class="line-chart" viewBox="0 0 ${chartWidth} ${chartHeight}" ${dailyAxis ? `style="width:${chartWidth}px;max-width:none"` : ""} role="img" aria-label="${escapeHtml(ariaLabel)}">
                 <line class="line-axis" x1="${left}" y1="${top}" x2="${left}" y2="${bottom}"></line>
                 <line class="line-axis" x1="${left}" y1="${bottom}" x2="${right}" y2="${bottom}"></line>
                 ${yTicks
@@ -2185,15 +2199,20 @@
                 ${labelIndexes
                     .map((index) => {
                         const tickX = x(index);
-                        const anchor =
-                            safeLabels.length === 1
+                        const anchor = dailyAxis
+                            ? "end"
+                            : safeLabels.length === 1
                                 ? "middle"
                                 : index === 0
                                   ? "start"
                                   : index === safeLabels.length - 1
                                     ? "end"
                                     : "middle";
-                        return `<line class="line-grid line-x-grid" x1="${tickX}" y1="${top}" x2="${tickX}" y2="${bottom}"></line><line class="line-tick" x1="${tickX}" y1="${bottom}" x2="${tickX}" y2="${bottom + 6}"></line><text class="line-axis-label line-x-label" text-anchor="${anchor}" x="${tickX}" y="260">${escapeHtml(safeLabels[index])}</text>`;
+                        const labelY = dailyAxis ? bottom + 16 : 260;
+                        const transform = dailyAxis
+                            ? ` transform="rotate(-60 ${tickX} ${labelY})"`
+                            : "";
+                        return `<line class="line-grid line-x-grid${dailyAxis ? " line-daily-grid" : ""}" x1="${tickX}" y1="${top}" x2="${tickX}" y2="${bottom}"></line><line class="line-tick" x1="${tickX}" y1="${bottom}" x2="${tickX}" y2="${bottom + 6}"></line><text class="line-axis-label line-x-label${dailyAxis ? " line-daily-label" : ""}" text-anchor="${anchor}" x="${tickX}" y="${labelY}"${transform}>${escapeHtml(safeLabels[index])}</text>`;
                     })
                     .join("")}
                 ${safeSeries
@@ -2219,9 +2238,10 @@
                         `;
                     })
                     .join("")}
-                <text class="line-axis-title" text-anchor="middle" x="520" y="292">时间</text>
+                <text class="line-axis-title" text-anchor="middle" x="${(left + right) / 2}" y="${dailyAxis ? 322 : 292}">${dailyAxis ? "日期（每日）" : "时间"}</text>
                 <text class="line-axis-title" text-anchor="middle" x="-115" y="14" transform="rotate(-90)">${escapeHtml(yAxisLabel)}</text>
               </svg>
+              </div>
             </article>
         `;
     }
@@ -2392,7 +2412,12 @@
             prTrend.labels,
             prTrend.series,
             "PR 数量",
+            true,
         );
+        const dailyChart = ui.prCharts.querySelector(
+            '[data-daily-axis="true"]',
+        );
+        if (dailyChart) dailyChart.scrollLeft = dailyChart.scrollWidth;
 
         const mergeHeader = isOpen
             ? ""
@@ -3257,6 +3282,7 @@
             .line-legend span { display: inline-flex; align-items: center; gap: 5px; }
             .line-legend i { width: 9px; height: 9px; border-radius: 50%; }
             .line-chart-card { grid-column: 1 / -1; }
+            .line-chart-scroll { width: 100%; overflow-x: auto; overflow-y: hidden; }
             .line-chart { display: block; width: 100%; height: auto; overflow: visible; }
             .line-grid { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
             .line-x-grid { opacity: .35; }
@@ -3264,6 +3290,8 @@
             .line-path { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
             .line-point { stroke: var(--panel-bg); stroke-width: 2; vector-effect: non-scaling-stroke; }
             .line-axis-label { fill: var(--muted); font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+            .line-daily-label { font-size: 11px; }
+            .line-daily-grid { opacity: .18; }
             .line-axis-title { fill: var(--text); font: 600 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
             .table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
             table { width: 100%; border-collapse: collapse; white-space: nowrap; }
@@ -3360,7 +3388,7 @@
               </details>
               <p class="help">
                 主 GraphQL 查询保留 PR/Issue 标题和正文；评论/Review 只请求作者、身份关系、发布时间和修改时间，不请求正文。“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
-                PR 趋势按创建日期分组，缺失日期补 0；回复与 stale 曲线表示该日期创建的 PR 在当前分析时的状态，并非历史快照。stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
+                PR 趋势按创建日期分组，缺失日期补 0；横坐标每天显示一个完整日期，历史较长时可横向滚动并默认定位到最新日期。回复与 stale 曲线表示该日期创建的 PR 在当前分析时的状态，并非历史快照。stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
                 贡献者仅统计提交过 PR 或出现在 Commit 数据中的代码贡献者，Issue-only 用户不计入。核心贡献者默认指内部成员，或达到 5 个合并 PR、10 次 Review、20 个 Commit 任一阈值。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间精确到周。
                 执行流程严格分为“读取原始数据”和“本地分析”两个阶段；只有读取阶段访问 GitHub API，本地分析每处理 50 条更新一次日志和进度条。点击“暂停”会等待当前 API 请求完成，再保存检查点并停止。
               </p>
