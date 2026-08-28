@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.27
+// @version      0.6.28
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,10 +22,11 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.27";
+    const SCRIPT_VERSION = "0.6.28";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
+        preciseContributors: false,
         completeInteractions: false,
     });
     const MAX_PAGE_SIZE = 100;
@@ -155,6 +156,38 @@
           rateLimit { cost limit remaining resetAt used }
         }
     `;
+    const PRECISE_COMMIT_QUERY = `
+        query(
+          $owner: String!
+          $name: String!
+          $commitCursor: String
+          $pageSize: Int!
+        ) {
+          repository(owner: $owner, name: $name) {
+            defaultBranchRef {
+              target {
+                ... on Commit {
+                  history(first: $pageSize, after: $commitCursor) {
+                    totalCount
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      committedDate
+                      parents(first: 2) { totalCount }
+                      associatedPullRequests(first: 1) { totalCount }
+                      authors(first: 100) {
+                        totalCount
+                        pageInfo { hasNextPage }
+                        nodes { user { login } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          rateLimit { cost limit remaining resetAt used }
+        }
+    `;
 
     let ui;
     let currentRepository;
@@ -174,6 +207,8 @@
         overflowRest: 0,
         inlineCommentRest: 0,
         commitStatsRest: 0,
+        preciseCommitGraphqlPoints: 0,
+        preciseCommitGraphqlRequests: 0,
     };
     let overflowItems = [];
 
@@ -184,6 +219,7 @@
             selectedScope,
             Boolean(options.includeIssues),
             Boolean(options.includeCommits),
+            Boolean(options.preciseContributors),
             Boolean(options.completeInteractions),
         ]);
     }
@@ -194,6 +230,20 @@
                 fetchCheckpointKey(repository, selectedScope, options)
             ? fetchCheckpoint
             : null;
+    }
+
+    function formatCheckpointProgress(checkpoint) {
+        if (!checkpoint) return "";
+        const parts = [
+            `PR ${checkpoint.pullRequests?.length || 0}/${checkpoint.prTotal ?? "?"}`,
+            `Issue ${checkpoint.issues?.length || 0}/${checkpoint.issueTotal ?? "?"}`,
+        ];
+        if (checkpoint.selectedOptions?.preciseContributors) {
+            parts.push(
+                `Commit ${checkpoint.preciseCommitScanned || 0}/${checkpoint.preciseCommitTotal ?? "?"}`,
+            );
+        }
+        return parts.join("、");
     }
 
     function clearFetchCheckpoint() {
@@ -678,12 +728,85 @@
         };
     }
 
+    function mergePreciseCommitPage(entries, nodes) {
+        const byLogin = new Map();
+        for (const entry of entries || []) {
+            const login = entry.author?.login || "(匿名或已删除账号)";
+            byLogin.set(login, {
+                login,
+                days: new Map(
+                    (entry.weeks || []).map((day) => [
+                        Number(day.w),
+                        Number(day.c) || 0,
+                    ]),
+                ),
+            });
+        }
+        let includedCommits = 0;
+        let excludedPullRequestCommits = 0;
+        let excludedMergeCommits = 0;
+        let truncatedAuthorCommits = 0;
+        let authorAttributions = 0;
+        for (const commit of nodes || []) {
+            if ((commit.associatedPullRequests?.totalCount || 0) > 0) {
+                excludedPullRequestCommits += 1;
+                continue;
+            }
+            if ((commit.parents?.totalCount || 0) > 1) {
+                excludedMergeCommits += 1;
+                continue;
+            }
+            includedCommits += 1;
+            if (commit.authors?.pageInfo?.hasNextPage) {
+                truncatedAuthorCommits += 1;
+            }
+            const logins = new Set(
+                (commit.authors?.nodes || []).map(
+                    (author) =>
+                        author.user?.login || "(匿名或已删除账号)",
+                ),
+            );
+            if (!logins.size) logins.add("(匿名或已删除账号)");
+            const day = String(commit.committedDate || "").slice(0, 10);
+            const timestamp = Date.parse(`${day}T00:00:00Z`) / 1000;
+            if (!Number.isFinite(timestamp)) continue;
+            for (const login of logins) {
+                if (!byLogin.has(login)) {
+                    byLogin.set(login, { login, days: new Map() });
+                }
+                const row = byLogin.get(login);
+                row.days.set(timestamp, (row.days.get(timestamp) || 0) + 1);
+                authorAttributions += 1;
+            }
+        }
+        return {
+            entries: [...byLogin.values()].map((row) => {
+                const weeks = [...row.days.entries()]
+                    .filter(([, count]) => count > 0)
+                    .sort(([left], [right]) => left - right)
+                    .map(([w, c]) => ({ w, c }));
+                return {
+                    author: { login: row.login },
+                    total: weeks.reduce((sum, day) => sum + day.c, 0),
+                    weeks,
+                };
+            }),
+            scannedCommits: (nodes || []).length,
+            includedCommits,
+            excludedPullRequestCommits,
+            excludedMergeCommits,
+            truncatedAuthorCommits,
+            authorAttributions,
+        };
+    }
+
     function buildContributorStatistics(
         pullRequests,
         issues,
         commitEntries,
         fullHistory,
         now = Date.now(),
+        preciseContributors = false,
     ) {
         const people = new Map();
         const person = (login) => {
@@ -751,13 +874,15 @@
                 if (author) author.mergedPrCount += 1;
             }
             activity(pr.editor?.login, "", pr.lastEditedAt, "edit");
-            const lastCommit = pr.commits?.nodes?.[0]?.commit;
-            activity(
-                lastCommit?.author?.user?.login,
-                "",
-                lastCommit?.committedDate,
-                "commit",
-            );
+            if (!preciseContributors) {
+                const lastCommit = pr.commits?.nodes?.[0]?.commit;
+                activity(
+                    lastCommit?.author?.user?.login,
+                    "",
+                    lastCommit?.committedDate,
+                    "commit",
+                );
+            }
             for (const event of interactionEvents(pr)) {
                 activity(
                     event.login,
@@ -838,7 +963,10 @@
                 bot,
                 internal,
                 external: !bot && !internal,
-                firstTimeContributor: row.prCount === 1,
+                preciseContributors,
+                firstTimeContributor:
+                    row.prCount === 1 ||
+                    (preciseContributors && row.commitCount === 1),
                 recurringExternal:
                     !bot &&
                     !internal &&
@@ -932,6 +1060,7 @@
                     codeDays,
                     commitDays,
                     cumulativeCommits,
+                    preciseContributors: Boolean(row.preciseContributors),
                 };
             })
             .filter((row) => row.codeDays.length);
@@ -988,7 +1117,12 @@
                         : Infinity;
                 const active30 = activityAge <= 30;
                 const active90 = activityAge <= 90;
-                if (prCount === 1) first += 1;
+                if (
+                    prCount === 1 ||
+                    (contributor.preciseContributors && commitCount === 1)
+                ) {
+                    first += 1;
+                }
                 if (active30) d30 += 1;
                 if (active90) d90 += 1;
                 if (
@@ -1017,7 +1151,9 @@
             series: [
                 {
                     key: "first",
-                    label: "首个贡献者（仅 1 个 PR）",
+                    label: contributors.some((row) => row.preciseContributors)
+                        ? "首个贡献者（仅 1 个 PR 或 1 个非 PR Commit）"
+                        : "首个贡献者（仅 1 个 PR）",
                     tone: "gray",
                     values: firstValues,
                 },
@@ -1046,7 +1182,7 @@
                     values: coreValues,
                 },
             ],
-            note: `每日收盘快照；D30、D90 按最近活动计算，五类条件可重叠；Commit 活动精确到周。${fullHistory ? "" : "当前仅 Open 数据，历史 PR 数和分类可能不完整。"}`,
+            note: `每日收盘快照；D30、D90 按最近活动计算，五类条件可重叠；Commit 活动${contributors.some((row) => row.preciseContributors) ? "精确到天，已排除 PR 关联 Commit" : "精确到周"}。${fullHistory ? "" : "当前仅 Open 数据，历史 PR 数和分类可能不完整。"}`,
         };
     }
 
@@ -1798,6 +1934,10 @@
         shouldPause = () => false,
     ) {
         const selectedOptions = { ...DEFAULT_OPTIONS, ...requestedOptions };
+        selectedOptions.preciseContributors = Boolean(
+            selectedOptions.includeCommits &&
+                selectedOptions.preciseContributors,
+        );
         const checkpointKey = fetchCheckpointKey(
             repository,
             selectedScope,
@@ -1831,14 +1971,25 @@
             overflowRest: 0,
             inlineCommentRest: 0,
             commitStatsRest: 0,
+            preciseCommitGraphqlPoints: 0,
+            preciseCommitGraphqlRequests: 0,
             ...(resume?.usage || {}),
         };
+        let commitContributors = Array.isArray(resume?.commitContributors)
+            ? resume.commitContributors
+            : [];
         let prCursor = resume?.prCursor || null;
         let issueCursor = resume?.issueCursor || null;
+        let commitCursor = resume?.commitCursor || null;
         let fetchPulls = resume ? Boolean(resume.fetchPulls) : true;
         let fetchIssues = resume
             ? Boolean(resume.fetchIssues)
             : selectedOptions.includeIssues;
+        let fetchCommits = selectedOptions.preciseContributors
+            ? resume
+                ? Boolean(resume.fetchCommits)
+                : true
+            : false;
         let prTotal = resume?.prTotal ?? null;
         let issueTotal = resume
             ? (resume.issueTotal ?? null)
@@ -1848,6 +1999,16 @@
         let page = Number(resume?.page) || 0;
         let prPage = Number(resume?.prPage) || 0;
         let issuePage = Number(resume?.issuePage) || 0;
+        let commitPage = Number(resume?.commitPage) || 0;
+        let preciseCommitTotal = resume?.preciseCommitTotal ?? null;
+        let preciseCommitScanned = Number(resume?.preciseCommitScanned) || 0;
+        let preciseCommitIncluded = Number(resume?.preciseCommitIncluded) || 0;
+        let preciseCommitExcludedPr =
+            Number(resume?.preciseCommitExcludedPr) || 0;
+        let preciseCommitExcludedMerge =
+            Number(resume?.preciseCommitExcludedMerge) || 0;
+        let preciseCommitTruncatedAuthors =
+            Number(resume?.preciseCommitTruncatedAuthors) || 0;
         const combineResources = selectedScope === "open";
         const saveCheckpoint = (cloneGraphqlData = false) => {
             const state = {
@@ -1859,17 +2020,27 @@
                 pageSize,
                 pullRequests,
                 issues,
+                commitContributors,
                 rateLimits: { ...rateLimits },
                 usage: { ...usage },
                 prCursor,
                 issueCursor,
+                commitCursor,
                 fetchPulls,
                 fetchIssues,
+                fetchCommits,
                 prTotal,
                 issueTotal,
                 page,
                 prPage,
                 issuePage,
+                commitPage,
+                preciseCommitTotal,
+                preciseCommitScanned,
+                preciseCommitIncluded,
+                preciseCommitExcludedPr,
+                preciseCommitExcludedMerge,
+                preciseCommitTruncatedAuthors,
             };
             if (cloneGraphqlData) {
                 state.pullRequests = JSON.parse(JSON.stringify(pullRequests));
@@ -1886,7 +2057,7 @@
         saveCheckpoint();
         if (resume) {
             onProgress(
-                `恢复读取检查点；已有 PR ${pullRequests.length}/${prTotal ?? "?"}、Issue ${issues.length}/${issueTotal ?? "?"}；从未完成页继续`,
+                `恢复读取检查点；已有 PR ${pullRequests.length}/${prTotal ?? "?"}、Issue ${issues.length}/${issueTotal ?? "?"}${selectedOptions.preciseContributors ? `、Commit ${preciseCommitScanned}/${preciseCommitTotal ?? "?"}` : ""}；从未完成页继续`,
                 rateLimits.graphql,
             );
         }
@@ -2086,26 +2257,161 @@
             stopIfPaused();
         }
 
-        let commitResult = { entries: null, status: null };
-        if (selectedOptions.includeCommits) {
+        while (fetchCommits) {
             stopIfPaused();
-            onProgress("开始读取 Commit 贡献者统计", null, {
-                value: null,
-                label: "读取数据：Commit 贡献者统计",
-            });
-            commitResult = await fetchCommitContributors(
-                repository,
-                token,
-                usage,
-                rateLimits,
-                onProgress,
+            const requestLabel = `精细 Commit 第 ${commitPage + 1} 页（${commitCursor ? "续页" : "首页"}）`;
+            let data;
+            let requestSeconds;
+            let retryCount = 0;
+            while (true) {
+                stopIfPaused();
+                onProgress(
+                    `准备请求 GraphQL ${requestLabel}；对象上限 ${pageSize}/页；读取默认分支作者、合作者与 PR 关联，不读取 Commit 正文或 diff`,
+                    null,
+                );
+                const requestStartedAt = Date.now();
+                try {
+                    data = await requestGraphQL(
+                        PRECISE_COMMIT_QUERY,
+                        token,
+                        {
+                            owner: repository.owner,
+                            name: repository.name,
+                            commitCursor,
+                            pageSize,
+                        },
+                        {
+                            onHeartbeat: (elapsedSeconds) =>
+                                onProgress(
+                                    `GraphQL ${requestLabel} 请求仍在进行；已等待 ${elapsedSeconds} 秒；${GRAPHQL_WATCHDOG_MS / 1000} 秒无回调将中止并自动重试`,
+                                    null,
+                                ),
+                        },
+                    );
+                    requestSeconds = (
+                        (Date.now() - requestStartedAt) /
+                        1000
+                    ).toFixed(1);
+                    break;
+                } catch (error) {
+                    const seconds = (
+                        (Date.now() - requestStartedAt) /
+                        1000
+                    ).toFixed(1);
+                    const failure = `GraphQL ${requestLabel}失败；对象上限 ${pageSize}/页；耗时 ${seconds} 秒`;
+                    if (!isRetryableGraphqlFailure(error)) {
+                        saveCheckpoint();
+                        throw new Error(
+                            `${failure}；未自动重试：该错误不是可降级重试的临时 GraphQL 错误；${error.message || String(error)}`,
+                        );
+                    }
+                    retryCount += 1;
+                    const previousPageSize = pageSize;
+                    pageSize = Math.max(
+                        MIN_PAGE_SIZE,
+                        pageSize - PAGE_SIZE_STEP,
+                    );
+                    saveCheckpoint();
+                    const pageSizeMessage =
+                        previousPageSize === pageSize
+                            ? `保持最小对象上限 ${pageSize}/页`
+                            : `对象上限 ${previousPageSize} → ${pageSize}/页`;
+                    onProgress(
+                        `${failure}；原因：${error.message || String(error)}；临时错误不进行额度复核；${pageSizeMessage}；第 ${retryCount} 次自动重试`,
+                        null,
+                    );
+                }
+            }
+            if (!data?.repository) {
+                saveCheckpoint();
+                throw new Error("仓库不存在，或 Token 没有读取 Commit 的权限");
+            }
+            const connection =
+                data.repository.defaultBranchRef?.target?.history || null;
+            if (!connection) {
+                preciseCommitTotal = 0;
+                fetchCommits = false;
+                saveCheckpoint();
+                onProgress("默认分支没有可遍历的 Commit；精细贡献者统计按 0 条处理", null);
+                break;
+            }
+            commitPage += 1;
+            preciseCommitTotal ??= connection.totalCount;
+            const merged = mergePreciseCommitPage(
+                commitContributors,
+                connection.nodes,
             );
+            commitContributors = merged.entries;
+            preciseCommitScanned += merged.scannedCommits;
+            preciseCommitIncluded += merged.includedCommits;
+            preciseCommitExcludedPr += merged.excludedPullRequestCommits;
+            preciseCommitExcludedMerge += merged.excludedMergeCommits;
+            preciseCommitTruncatedAuthors += merged.truncatedAuthorCommits;
+            commitCursor = connection.pageInfo.endCursor;
+            fetchCommits = connection.pageInfo.hasNextPage;
+            const rateLimit = { ...data.rateLimit, resource: "graphql" };
+            usage.graphqlPoints += rateLimit.cost;
+            usage.graphqlRequests += 1;
+            usage.preciseCommitGraphqlPoints += rateLimit.cost;
+            usage.preciseCommitGraphqlRequests += 1;
+            rateLimits.graphql = rateLimit;
+            onProgress(
+                `GraphQL 精细 Commit 第 ${commitPage} 次请求完成；对象上限 ${pageSize}/页；已遍历 ${preciseCommitScanned}/${preciseCommitTotal ?? "?"}；保留非 PR Commit ${preciseCommitIncluded}，排除 PR 关联 ${preciseCommitExcludedPr}、merge ${preciseCommitExcludedMerge}；cost ${rateLimit.cost}；耗时 ${requestSeconds} 秒`,
+                rateLimit,
+                {
+                    value: preciseCommitTotal
+                        ? (100 * preciseCommitScanned) / preciseCommitTotal
+                        : 100,
+                    label: `读取数据：精细 Commit ${preciseCommitScanned}/${preciseCommitTotal ?? "?"}`,
+                },
+            );
+            const nextPageSize = Math.min(
+                MAX_PAGE_SIZE,
+                pageSize + PAGE_SIZE_STEP,
+            );
+            if (fetchCommits && nextPageSize !== pageSize) {
+                onProgress(
+                    `本页成功；后续页对象上限 ${pageSize} → ${nextPageSize}/页`,
+                    null,
+                );
+                pageSize = nextPageSize;
+            }
+            saveCheckpoint();
             stopIfPaused();
         }
 
-        // ponytail: exact inline comments are opt-in because Open scope costs at
-        // least one REST request per PR; exact per-commit history is intentionally
-        // replaced by GitHub's single cached contributor-statistics endpoint.
+        if (selectedOptions.preciseContributors && preciseCommitTruncatedAuthors) {
+            onProgress(
+                `精细 Commit 读取完成；${preciseCommitTruncatedAuthors} 个 Commit 超过 100 位作者/合作者，仅统计每个 Commit 前 100 位`,
+                null,
+            );
+        }
+
+        let commitResult = { entries: null, status: null };
+        if (selectedOptions.includeCommits) {
+            if (selectedOptions.preciseContributors) {
+                commitResult = {
+                    entries: commitContributors,
+                    status: 200,
+                };
+            } else {
+                stopIfPaused();
+                onProgress("开始读取 Commit 贡献者统计", null, {
+                    value: null,
+                    label: "读取数据：Commit 贡献者统计",
+                });
+                commitResult = await fetchCommitContributors(
+                    repository,
+                    token,
+                    usage,
+                    rateLimits,
+                    onProgress,
+                );
+                stopIfPaused();
+            }
+        }
+
+        // ponytail: high-cost inline comments and per-commit history stay opt-in.
         return {
             coverage: {
                 fullHistory: selectedScope === "all",
@@ -2113,6 +2419,16 @@
                 completeInteractions: selectedOptions.completeInteractions,
                 inlineComments: selectedOptions.completeInteractions,
                 commitStatus: commitResult.status,
+                preciseContributors: selectedOptions.preciseContributors,
+                commitDatePrecision: selectedOptions.preciseContributors
+                    ? "day"
+                    : "week",
+                preciseCommitTotal,
+                preciseCommitScanned,
+                preciseCommitIncluded,
+                preciseCommitExcludedPr,
+                preciseCommitExcludedMerge,
+                preciseCommitTruncatedAuthors,
             },
             raw: {
                 repository,
@@ -2189,6 +2505,7 @@
             commitEntries,
             fetchedData.coverage.fullHistory,
             Date.parse(fetchedData.raw.fetchedAt) || Date.now(),
+            fetchedData.coverage.preciseContributors,
         );
         await report("贡献者聚合完成；正在汇总 Commit 分布…", 95);
         const commitStats = analyzeCommitContributors(commitEntries);
@@ -2840,6 +3157,9 @@
     function renderCostGuide() {
         const issueCount = analysis?.issueRows.length || 0;
         const usage = analysis?.usage || lastUsage;
+        const preciseContributors = Boolean(
+            ui?.preciseContributors?.checked,
+        );
         const rows = [
             [
                 "PR 标题/正文/作者/状态/时间/改动量/stale",
@@ -2892,10 +3212,14 @@
             ],
             [
                 "Commit 时间与作者分布",
-                "REST /stats/contributors",
+                preciseContributors
+                    ? "GraphQL 默认分支 Commit history"
+                    : "REST /stats/contributors",
                 "是",
-                `实际 ${usage.commitStatsRest || 0} 请求`,
-                "低",
+                preciseContributors
+                    ? `实际 ${usage.preciseCommitGraphqlRequests || 0} 请求 / ${usage.preciseCommitGraphqlPoints || 0} points`
+                    : `实际 ${usage.commitStatsRest || 0} 请求`,
+                preciseContributors ? "很高/可续传" : "低",
             ],
             [
                 "REST/GraphQL 当前额度",
@@ -2905,10 +3229,14 @@
                 "低",
             ],
             [
-                "逐条 Commit 的精确时间、匿名作者和 merge commit",
-                "未启用：需完整 Commit 分页",
-                "是",
-                "约 1 REST 请求 / 100 commits",
+                "逐条 Commit 主作者/合作者、精确日期与 PR 关联过滤",
+                preciseContributors
+                    ? "已启用：GraphQL history + associatedPullRequests"
+                    : "可选：精细统计贡献者",
+                "模块可选",
+                preciseContributors
+                    ? `每页最多 ${MAX_PAGE_SIZE} 条；实际见日志`
+                    : `约 1 GraphQL 请求 / ${MAX_PAGE_SIZE} commits`,
                 "很高",
             ],
         ];
@@ -3147,6 +3475,13 @@
         }
 
         const contributorSummary = analysis.contributors;
+        const firstContributorLabel = analysis.coverage.preciseContributors
+            ? analysis.coverage.fullHistory
+                ? "首个贡献者（1 PR 或 1 直接 Commit）"
+                : "首个贡献者（PR 仅 Open）"
+            : analysis.coverage.fullHistory
+              ? "首个贡献者"
+              : "Open 中仅 1 个 PR";
         const contributorTrend = buildContributorTrend(
             contributorSummary.rows,
             analysis.raw.fetchedAt,
@@ -3173,9 +3508,7 @@
             ["内部成员", contributorSummary.internal],
             ["核心贡献者", contributorSummary.core],
             [
-                analysis.coverage.fullHistory
-                    ? "首个贡献者"
-                    : "Open 中仅 1 个 PR",
+                firstContributorLabel,
                 contributorSummary.firstTime,
             ],
         ]);
@@ -3219,7 +3552,7 @@
                 "purple",
             ),
             rateRow(
-                analysis.coverage.fullHistory ? "首个贡献者" : "Open 中仅 1 个 PR",
+                firstContributorLabel,
                 contributorSummary.firstTime,
                 contributorSummary.count,
                 "gray",
@@ -3275,12 +3608,29 @@
             const commits = analysis.commitStats;
             if (commits) {
                 ui.commitCards.innerHTML = cardsMarkup([
-                    ["统计作者 Commit", commits.totalCommits, "key"],
-                    ["作者数", commits.contributorCount, "key"],
+                    [
+                        analysis.coverage.preciseContributors
+                            ? "非 PR Commit 作者计次"
+                            : "统计作者 Commit",
+                        commits.totalCommits,
+                        "key",
+                    ],
+                    [
+                        analysis.coverage.preciseContributors
+                            ? "作者/合作者数"
+                            : "作者数",
+                        commits.contributorCount,
+                        "key",
+                    ],
                     ["Top 1 占比", rate(commits.authors[0]?.total || 0, commits.totalCommits)],
                     ["Top 3 占比", `${(commits.top3Share * 100).toFixed(2)}%`],
                     ["Top 5 占比", `${(commits.top5Share * 100).toFixed(2)}%`],
-                    ["最近活跃周", formatDate(commits.lastActiveWeek)],
+                    [
+                        analysis.coverage.preciseContributors
+                            ? "最近活跃日"
+                            : "最近活跃周",
+                        formatDate(commits.lastActiveWeek),
+                    ],
                 ]);
                 const monthlyLabels = commits.monthly.map(([month]) => month);
                 const monthlySeries = [
@@ -3355,12 +3705,17 @@
         if (!analysis.coverage.fullHistory) {
             warnings.push("贡献者活动计数只覆盖 Open 对象；首次身份使用 GitHub 关联字段");
         }
+        if (analysis.coverage.preciseContributors) {
+            warnings.push(
+                `精细贡献者已遍历默认分支 ${analysis.coverage.preciseCommitScanned}/${analysis.coverage.preciseCommitTotal ?? "?"} 个 Commit，保留 ${analysis.coverage.preciseCommitIncluded} 个直接 Commit，排除 PR 关联 ${analysis.coverage.preciseCommitExcludedPr} 个、merge ${analysis.coverage.preciseCommitExcludedMerge} 个`,
+            );
+        }
         const warning = warnings.length ? `；覆盖说明：${warnings.join("；")}` : "";
         const quotas = formatRateLimits();
         const rateLimit = quotas
             ? `；GitHub /rate_limit 实时额度：${quotas}`
             : "；GitHub /rate_limit 实时额度：查询失败";
-        const usage = `；本次脚本数据请求（本地计数，不是账户额度）：GraphQL ${lastUsage.graphqlPoints} points / ${lastUsage.graphqlRequests} 次，计费 REST ${lastUsage.restRequests} 次`;
+        const usage = `；本次脚本数据请求（本地计数，不是账户额度）：GraphQL ${lastUsage.graphqlPoints} points / ${lastUsage.graphqlRequests} 次${analysis.coverage.preciseContributors ? `（其中精细 Commit ${lastUsage.preciseCommitGraphqlPoints || 0} points / ${lastUsage.preciseCommitGraphqlRequests || 0} 次）` : ""}，计费 REST ${lastUsage.restRequests} 次`;
         setStatus(
             `已分析 ${analysis.rows.length} 个 PR、${analysis.issueRows.length} 个 Issue；当前显示 ${total} 个 PR${warning}${usage}${rateLimit}`,
             "success",
@@ -3446,6 +3801,7 @@
         ui.scopeOpen.disabled = value;
         ui.includeIssues.disabled = value;
         ui.includeCommits.disabled = value;
+        ui.preciseContributors.disabled = value || !ui.includeCommits.checked;
         ui.completeInteractions.disabled = value;
         ui.export.disabled = value || !analysis;
         const canResume =
@@ -3477,6 +3833,9 @@
         return {
             includeIssues: ui.includeIssues.checked,
             includeCommits: ui.includeCommits.checked,
+            preciseContributors:
+                ui.includeCommits.checked &&
+                ui.preciseContributors.checked,
             completeInteractions: ui.completeInteractions.checked,
         };
     }
@@ -3576,12 +3935,17 @@
             requestedScope === "open"
                 ? `合并 PR/Issue GraphQL 自适应分页（初始 ${MAX_PAGE_SIZE}/页，失败 -${PAGE_SIZE_STEP}，成功 +${PAGE_SIZE_STEP}，临时错误始终重试）`
                 : `PR/Issue 分离 GraphQL 自适应分页（初始 ${MAX_PAGE_SIZE}/页，失败 -${PAGE_SIZE_STEP}，成功 +${PAGE_SIZE_STEP}，临时错误始终重试）`;
-        const strategy = `${graphQlStrategy} + 单次 Commit 统计${
+        const commitStrategy = !requestedOptions.includeCommits
+            ? "不读取 Commit"
+            : requestedOptions.preciseContributors
+              ? `默认分支 Commit 明细 GraphQL 自适应分页（排除 PR 关联与 merge Commit）`
+              : "单次 Commit 统计";
+        const strategy = `${graphQlStrategy} + ${commitStrategy}${
             requestedOptions.completeInteractions
                 ? " + 完整互动 REST"
                 : "（不扫描行内评论）"
         }`;
-        const modules = `模块：Issue ${requestedOptions.includeIssues ? "开" : "关"}，Commit ${requestedOptions.includeCommits ? "开" : "关"}，完整互动 ${requestedOptions.completeInteractions ? "开" : "关"}`;
+        const modules = `模块：Issue ${requestedOptions.includeIssues ? "开" : "关"}，Commit ${requestedOptions.includeCommits ? "开" : "关"}，精细贡献者 ${requestedOptions.preciseContributors ? "开" : "关"}，完整互动 ${requestedOptions.completeInteractions ? "开" : "关"}`;
         lastRateLimits = { graphql: null, rest: null };
         lastUsage = {
             graphqlPoints: 0,
@@ -3590,6 +3954,8 @@
             overflowRest: 0,
             inlineCommentRest: 0,
             commitStatsRest: 0,
+            preciseCommitGraphqlPoints: 0,
+            preciseCommitGraphqlRequests: 0,
             ...(resumeCheckpoint?.usage || {}),
         };
         analysis = null;
@@ -3603,7 +3969,7 @@
         setStatus(
             `脚本 v${SCRIPT_VERSION}；${resumeCheckpoint ? "继续读取" : "开始读取"} ${currentRepository.owner}/${currentRepository.name} 的原始数据；范围：${
                 requestedScope === "open" ? "仅 Open" : "全部历史"
-            }；${resumeCheckpoint ? `已保留 PR ${resumeCheckpoint.pullRequests?.length || 0}/${resumeCheckpoint.prTotal ?? "?"}、Issue ${resumeCheckpoint.issues?.length || 0}/${resumeCheckpoint.issueTotal ?? "?"}；` : ""}低额度策略：${strategy}；${modules}`,
+            }；${resumeCheckpoint ? `已保留 ${formatCheckpointProgress(resumeCheckpoint)}；` : ""}低额度策略：${strategy}；${modules}`,
         );
         let baselineRateLimits = null;
         try {
@@ -3680,7 +4046,7 @@
             ui.pause.disabled = true;
             setProgress(100, "原始数据读取完成");
             setStatus(
-                `原始数据读取完成：${fetchedData.raw.pullRequests.length} 个 PR、${fetchedData.raw.issues.length} 个 Issue；所有 GitHub API 请求已结束，开始本地分析`,
+                `原始数据读取完成：${fetchedData.raw.pullRequests.length} 个 PR、${fetchedData.raw.issues.length} 个 Issue${fetchedData.coverage.preciseContributors ? `、遍历 ${fetchedData.coverage.preciseCommitScanned}/${fetchedData.coverage.preciseCommitTotal ?? "?"} 个 Commit` : ""}；所有 GitHub API 请求已结束，开始本地分析`,
                 "success",
             );
             await yieldToUi();
@@ -3710,7 +4076,7 @@
                 if (fetchCheckpoint) {
                     try {
                         GM_setValue(CHECKPOINT_KEY, fetchCheckpoint);
-                        checkpointDetails = `；检查点已保存：PR ${fetchCheckpoint.pullRequests?.length || 0}/${fetchCheckpoint.prTotal ?? "?"}、Issue ${fetchCheckpoint.issues?.length || 0}/${fetchCheckpoint.issueTotal ?? "?"}`;
+                        checkpointDetails = `；检查点已保存：${formatCheckpointProgress(fetchCheckpoint)}`;
                     } catch (checkpointError) {
                         checkpointDetails = `；检查点持久化失败，但当前页面仍可继续：${checkpointError.message || String(checkpointError)}`;
                     }
@@ -3755,7 +4121,7 @@
             if (fetchCheckpoint) {
                 try {
                     GM_setValue(CHECKPOINT_KEY, fetchCheckpoint);
-                    checkpointDetails = `；读取检查点已保存：PR ${fetchCheckpoint.pullRequests?.length || 0}/${fetchCheckpoint.prTotal ?? "?"}、Issue ${fetchCheckpoint.issues?.length || 0}/${fetchCheckpoint.issueTotal ?? "?"}；点击“继续分析”将从未完成页继续`;
+                    checkpointDetails = `；读取检查点已保存：${formatCheckpointProgress(fetchCheckpoint)}；点击“继续分析”将从未完成页继续`;
                 } catch (checkpointError) {
                     checkpointDetails = `；检查点持久化失败，但当前页面仍可继续：${checkpointError.message || String(checkpointError)}`;
                 }
@@ -4094,7 +4460,8 @@
               </div>
               <div class="options" aria-label="分析模块">
                 <label><input id="include-issues" type="checkbox" checked>Issue 统计</label>
-                <label><input id="include-commits" type="checkbox" checked>Commit 概览（1 REST）</label>
+                <label><input id="include-commits" type="checkbox" checked>Commit 概览</label>
+                <label title="遍历默认分支全部 Commit；排除 PR 关联和 merge Commit，并统计主作者与 Co-authored-by 合作者。请求较多，但支持暂停、检查点和继续。"><input id="precise-contributors" type="checkbox">精细统计贡献者（遍历 Commit，高成本）</label>
                 <label title="Open 模式至少每个 PR 一次 REST；全部历史按每 100 条行内评论一次 REST"><input id="complete-interactions" type="checkbox">完整互动（高成本）</label>
               </div>
               <p id="status" role="status" aria-live="polite">请选择范围和选项，然后点击“开始分析”</p>
@@ -4153,7 +4520,7 @@
               <p class="help">
                 主 GraphQL 查询保留 PR/Issue 标题和正文；评论/Review 只请求作者、身份关系、发布时间和修改时间，不请求正文。“完整互动”的 REST 响应可能自带正文，但脚本会立即丢弃，不分析也不导出。行内 Review 评论仅在“完整互动”启用时加入。维护者指 OWNER、MEMBER 或 COLLABORATOR，并排除提交者本人和机器人。
                 PR 实线按创建日期累计，缺失日期沿用前一天累计值；提交者回复、维护者回复和 stale 显示为当前总数的不同线型水平参考线，图例与文字摘要始终显示数值，不只依赖颜色或悬停。图中不显示网格；横坐标每天显示一个完整日期，历史较长时可用键盘、滚动或前后 30 天按钮浏览并默认定位到最新日期，Y 轴会固定在左侧。回复与 stale 是当前分析状态，并非历史快照。stale 按最后一次人工创建、正文编辑、最新 PR Commit、评论或 Review 计算，分别显示 30/90 天阈值；不会把机器人或标签更新当成人工活跃。
-                贡献者仅统计提交过 PR 或出现在 Commit 数据中的代码贡献者，Issue-only 用户不计入。首个贡献者指当前累计仅提交 1 个 PR；D30/D90 指近 30/90 天活跃；积极贡献者指 D30 活跃，且（Commit 超过 10 个或 PR 超过 3 个）；核心贡献者指 D30 活跃，且（Commit 超过 50 个或 PR 超过 10 个）。这些条件可重叠，折线按每日收盘状态计算。Commit 统计采用 GitHub 缓存口径，排除 merge commit；Commit 活跃时间和分类门槛精确到周。
+                贡献者仅统计提交过 PR 或出现在 Commit 数据中的代码贡献者，Issue-only 用户不计入。快速模式的首个贡献者仅按当前累计 1 个 PR 判断；启用“精细统计贡献者”后，首个贡献者按“仅 1 个 PR 或仅 1 个直接 Commit”判断，两种条件独立、满足其一即计入且每人只计一次。精细模式遍历默认分支，排除 GitHub 标记为由 PR 引入的 Commit 与 merge commit，同时统计主作者和 Co-authored-by 合作者；第二个直接 Commit 会使 Commit 条件失效，但仍可能满足仅 1 个 PR。D30/D90 指近 30/90 天活跃；积极贡献者指 D30 活跃，且（Commit 超过 10 个或 PR 超过 3 个）；核心贡献者指 D30 活跃，且（Commit 超过 50 个或 PR 超过 10 个）。这些条件可重叠，折线按每日收盘状态计算。快速 Commit 统计采用 GitHub 缓存口径、时间精确到周；精细模式精确到天，并且始终读取默认分支完整历史，不受“仅 Open”范围限制。
                 执行流程严格分为“读取原始数据”和“本地分析”两个阶段；只有读取阶段访问 GitHub API，本地分析每处理 50 条更新一次日志和进度条。点击“暂停”会等待当前 API 请求完成，再保存检查点并停止。
               </p>
             </main>
@@ -4176,6 +4543,7 @@
             scopeOpen: get("#scope-open"),
             includeIssues: get("#include-issues"),
             includeCommits: get("#include-commits"),
+            preciseContributors: get("#precise-contributors"),
             completeInteractions: get("#complete-interactions"),
             status: get("#status"),
             progressWrap: get("#progress-wrap"),
@@ -4216,6 +4584,8 @@
                     ? storedOptions[key]
                     : fallback;
         }
+        if (!ui.includeCommits.checked) ui.preciseContributors.checked = false;
+        ui.preciseContributors.disabled = !ui.includeCommits.checked;
 
         ui.launcher.addEventListener("click", () => {
             const opening = ui.panel.hidden;
@@ -4247,9 +4617,16 @@
         ui.saveToken.addEventListener("click", saveToken);
         ui.checkToken.addEventListener("click", refreshRateLimits);
         ui.clearToken.addEventListener("click", clearToken);
+        ui.includeCommits.addEventListener("change", () => {
+            if (!ui.includeCommits.checked) {
+                ui.preciseContributors.checked = false;
+            }
+            ui.preciseContributors.disabled = !ui.includeCommits.checked;
+            saveOptions();
+        });
         for (const input of [
             ui.includeIssues,
-            ui.includeCommits,
+            ui.preciseContributors,
             ui.completeInteractions,
         ]) {
             input.addEventListener("change", saveOptions);
@@ -4324,6 +4701,7 @@
                             ? fetchCheckpoint.selectedOptions[key]
                             : fallback;
                 }
+                ui.preciseContributors.disabled = !ui.includeCommits.checked;
             }
             const resumeCheckpoint = compatibleFetchCheckpoint(
                 repository,
@@ -4342,6 +4720,8 @@
                 overflowRest: 0,
                 inlineCommentRest: 0,
                 commitStatsRest: 0,
+                preciseCommitGraphqlPoints: 0,
+                preciseCommitGraphqlRequests: 0,
                 ...(resumeCheckpoint?.usage || {}),
             };
             ui.log.textContent = "";
@@ -4352,7 +4732,7 @@
                 : "开始分析";
             setStatus(
                 resumeCheckpoint
-                    ? `检测到未完成读取：PR ${resumeCheckpoint.pullRequests?.length || 0}/${resumeCheckpoint.prTotal ?? "?"}、Issue ${resumeCheckpoint.issues?.length || 0}/${resumeCheckpoint.issueTotal ?? "?"}；点击“继续分析”从未完成页继续`
+                    ? `检测到未完成读取：${formatCheckpointProgress(resumeCheckpoint)}；点击“继续分析”从未完成页继续`
                     : "请选择范围和选项，然后点击“开始分析”",
             );
         }
@@ -4375,6 +4755,7 @@
             formatRateLimitChange,
             isTokenAuthenticationError,
             lineChartMarkup,
+            mergePreciseCommitPage,
             recentMonthsStartIndex,
             normalizeRestComment,
             normalizeRestReview,

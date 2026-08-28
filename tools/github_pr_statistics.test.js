@@ -37,6 +37,12 @@ assert.match(
 );
 assert.match(userscriptSource, /navigator\.clipboard\?\.writeText/);
 assert.match(userscriptSource, /const GRAPHQL_WATCHDOG_MS = 15000;/);
+assert.match(
+    userscriptSource,
+    /id="precise-contributors"[^>]*>精细统计贡献者（遍历 Commit，高成本）/,
+);
+assert.match(userscriptSource, /associatedPullRequests\(first: 1\)/);
+assert.match(userscriptSource, /authors\(first: 100\)/);
 assert.match(userscriptSource, /id="snapshot" class="snapshot-strip"/);
 assert.match(userscriptSource, /pullRequestTrend: buildPullRequestTrend/);
 assert.match(userscriptSource, /id="contributor-trend"/);
@@ -201,6 +207,131 @@ const commitEntries = [
 const commits = stats.analyzeCommitContributors(commitEntries);
 assert.equal(commits.totalCommits, 40);
 assert.equal(commits.top1Share, 0.75);
+
+const preciseCommitDay1 = Date.parse("2026-01-01T00:00:00Z") / 1000;
+const preciseCommitDay2 = Date.parse("2026-01-02T00:00:00Z") / 1000;
+const precisePage = stats.mergePreciseCommitPage([], [
+    {
+        committedDate: "2026-01-01T12:00:00Z",
+        parents: { totalCount: 1 },
+        associatedPullRequests: { totalCount: 0 },
+        authors: {
+            pageInfo: { hasNextPage: false },
+            nodes: [
+                { user: { login: "alice" } },
+                { user: { login: "coauthor" } },
+                { user: { login: "alice" } },
+            ],
+        },
+    },
+    {
+        committedDate: "2026-01-02T12:00:00Z",
+        parents: { totalCount: 1 },
+        associatedPullRequests: { totalCount: 0 },
+        authors: {
+            pageInfo: { hasNextPage: false },
+            nodes: [{ user: { login: "alice" } }],
+        },
+    },
+    {
+        committedDate: "2026-01-03T12:00:00Z",
+        parents: { totalCount: 1 },
+        associatedPullRequests: { totalCount: 1 },
+        authors: {
+            pageInfo: { hasNextPage: false },
+            nodes: [{ user: { login: "pr-author" } }],
+        },
+    },
+    {
+        committedDate: "2026-01-04T12:00:00Z",
+        parents: { totalCount: 2 },
+        associatedPullRequests: { totalCount: 0 },
+        authors: {
+            pageInfo: { hasNextPage: false },
+            nodes: [{ user: { login: "merge-author" } }],
+        },
+    },
+]);
+assert.equal(precisePage.scannedCommits, 4);
+assert.equal(precisePage.includedCommits, 2);
+assert.equal(precisePage.excludedPullRequestCommits, 1);
+assert.equal(precisePage.excludedMergeCommits, 1);
+assert.equal(precisePage.authorAttributions, 3);
+assert.deepEqual(
+    precisePage.entries
+        .map((entry) => [entry.author.login, entry.total])
+        .sort(([left], [right]) => left.localeCompare(right)),
+    [
+        ["alice", 2],
+        ["coauthor", 1],
+    ],
+);
+assert.deepEqual(
+    precisePage.entries.find((entry) => entry.author.login === "alice").weeks,
+    [
+        { w: preciseCommitDay1, c: 1 },
+        { w: preciseCommitDay2, c: 1 },
+    ],
+);
+
+const preciseContributors = stats.buildContributorStatistics(
+    [],
+    [],
+    precisePage.entries,
+    true,
+    Date.parse("2026-01-03T00:00:00Z"),
+    true,
+);
+assert.equal(
+    preciseContributors.rows.find((row) => row.login === "alice")
+        .firstTimeContributor,
+    false,
+    "第二个直接 Commit 应移除首次 Commit 身份",
+);
+assert.equal(
+    preciseContributors.rows.find((row) => row.login === "coauthor")
+        .firstTimeContributor,
+    true,
+    "Co-authored-by 合作者的首个直接 Commit 也应计入",
+);
+const independentFirstContributor = stats.buildContributorStatistics(
+    [
+        {
+            author: { login: "alice" },
+            authorAssociation: "NONE",
+            createdAt: "2026-01-01T00:00:00Z",
+            comments: { nodes: [] },
+            reviews: { nodes: [] },
+            reviewComments: [],
+        },
+    ],
+    [],
+    precisePage.entries,
+    true,
+    Date.parse("2026-01-03T00:00:00Z"),
+    true,
+);
+assert.equal(
+    independentFirstContributor.rows.find((row) => row.login === "alice")
+        .firstTimeContributor,
+    true,
+    "PR 与直接 Commit 条件应独立；两个 Commit 不应取消仅一个 PR 的身份",
+);
+assert.equal(
+    preciseContributors.rows.some((row) => row.login === "pr-author"),
+    false,
+    "PR 关联 Commit 作者不应进入精细 Commit 贡献者",
+);
+const preciseTrend = stats.buildContributorTrend(
+    preciseContributors.rows,
+    "2026-01-02T23:59:59Z",
+    true,
+);
+const preciseFirst = preciseTrend.series.find(
+    (series) => series.key === "first",
+);
+assert.match(preciseFirst.label, /1 个非 PR Commit/);
+assert.deepEqual(preciseFirst.values, [2, 1]);
 
 const contributors = stats.buildContributorStatistics(
     [pr],
@@ -1410,6 +1541,153 @@ async function testPageSizeDropsAndRecoversByTen() {
     );
 }
 
+async function testPreciseCommitCheckpointAndResume() {
+    const resetAt = "2026-03-10T01:00:00Z";
+    let pause = false;
+    let checkpoint = null;
+    const preciseCursors = [];
+    global.GM_xmlhttpRequest = ({ data, onload }) => {
+        const variables = JSON.parse(data).variables;
+        if (Object.hasOwn(variables, "fetchPulls")) {
+            onload({
+                status: 200,
+                responseHeaders: "",
+                responseText: JSON.stringify({
+                    data: {
+                        repository: {
+                            pullRequests: {
+                                totalCount: 0,
+                                nodes: [],
+                                pageInfo: {
+                                    hasNextPage: false,
+                                    endCursor: null,
+                                },
+                            },
+                        },
+                        rateLimit: {
+                            cost: 1,
+                            limit: 5000,
+                            remaining: 4999,
+                            resetAt,
+                            used: 1,
+                        },
+                    },
+                }),
+            });
+            return;
+        }
+
+        preciseCursors.push(variables.commitCursor);
+        const firstPage = variables.commitCursor === null;
+        onload({
+            status: 200,
+            responseHeaders: "",
+            responseText: JSON.stringify({
+                data: {
+                    repository: {
+                        defaultBranchRef: {
+                            target: {
+                                history: {
+                                    totalCount: 2,
+                                    nodes: [
+                                        {
+                                            committedDate: firstPage
+                                                ? "2026-01-01T00:00:00Z"
+                                                : "2026-01-02T00:00:00Z",
+                                            parents: { totalCount: 1 },
+                                            associatedPullRequests: {
+                                                totalCount: 0,
+                                            },
+                                            authors: {
+                                                pageInfo: {
+                                                    hasNextPage: false,
+                                                },
+                                                nodes: [
+                                                    {
+                                                        user: {
+                                                            login: "direct-author",
+                                                        },
+                                                    },
+                                                ],
+                                            },
+                                        },
+                                    ],
+                                    pageInfo: {
+                                        hasNextPage: firstPage,
+                                        endCursor: firstPage
+                                            ? "commit-1"
+                                            : null,
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    rateLimit: {
+                        cost: 2,
+                        limit: 5000,
+                        remaining: firstPage ? 4997 : 4995,
+                        resetAt,
+                        used: firstPage ? 3 : 5,
+                    },
+                },
+            }),
+        });
+    };
+
+    const options = {
+        includeIssues: false,
+        includeCommits: true,
+        preciseContributors: true,
+        completeInteractions: false,
+    };
+    await assert.rejects(
+        stats.fetchRepositoryData(
+            { owner: "o", name: "r" },
+            "token",
+            "all",
+            (message) => {
+                if (/精细 Commit 第 1 次请求完成/.test(message)) {
+                    pause = true;
+                }
+            },
+            options,
+            null,
+            null,
+            (state) => {
+                checkpoint = JSON.parse(JSON.stringify(state));
+            },
+            () => pause,
+        ),
+        (error) => error.paused === true,
+    );
+    assert.equal(checkpoint.preciseCommitScanned, 1);
+    assert.equal(checkpoint.preciseCommitTotal, 2);
+    assert.equal(checkpoint.commitCursor, "commit-1");
+    assert.equal(checkpoint.fetchCommits, true);
+    assert.equal(checkpoint.commitContributors[0].total, 1);
+
+    pause = false;
+    const resumed = await stats.fetchRepositoryData(
+        { owner: "o", name: "r" },
+        "token",
+        "all",
+        () => {},
+        options,
+        null,
+        checkpoint,
+        (state) => {
+            checkpoint = JSON.parse(JSON.stringify(state));
+        },
+    );
+    assert.deepEqual(preciseCursors, [null, "commit-1"]);
+    assert.equal(resumed.coverage.preciseCommitScanned, 2);
+    assert.equal(resumed.coverage.preciseCommitIncluded, 2);
+    assert.equal(resumed.raw.commitContributors[0].total, 2);
+    assert.equal(resumed.usage.graphqlRequests, 3);
+    assert.equal(resumed.usage.preciseCommitGraphqlRequests, 2);
+    assert.equal(resumed.usage.restRequests, 0);
+}
+
 async function testRateLimitLookup() {
     global.GM_xmlhttpRequest = ({ method, url, headers, nocache, onload }) => {
         assert.equal(method, "GET");
@@ -1485,6 +1763,7 @@ testSeparatedLocalAnalysis()
     .then(testGraphqlNetworkErrorDetailsAndRetry)
     .then(testGraphqlRetriesAtMinimumPageSize)
     .then(testPageSizeDropsAndRecoversByTen)
+    .then(testPreciseCommitCheckpointAndResume)
     .then(testRateLimitLookup)
     .then(testInvalidTokenLookup)
     .then(() => console.log("github_pr_statistics tests passed"))
