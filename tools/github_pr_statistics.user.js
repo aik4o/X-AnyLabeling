@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.22
+// @version      0.6.23
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.22";
+    const SCRIPT_VERSION = "0.6.23";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -568,16 +568,19 @@
             labels,
             series: [
                 {
+                    key: "open",
                     label: "Open PR",
                     tone: "green",
                     values: openValues,
                 },
                 {
+                    key: "merge",
                     label: "累计 Merge PR",
                     tone: "purple",
                     values: mergedValues,
                 },
                 {
+                    key: "close",
                     label: "累计 Close PR（未合并）",
                     tone: "red",
                     values: closedValues,
@@ -2189,8 +2192,10 @@
         const safeLabels = labels.map((label) => String(label));
         const normalizeSeries = (sourceLabels, sourceSeries) =>
             (sourceSeries || []).map((item, index) => ({
+                key: String(item.key || `series-${index}`),
                 label: item.label,
                 tone: CHART_COLORS[item.tone] ? item.tone : "blue",
+                active: item.active !== false,
                 reference: Boolean(item.reference),
                 dash:
                     item.dash ||
@@ -2206,7 +2211,11 @@
                 }),
             }));
         const safeSeries = normalizeSeries(safeLabels, series);
-        if (!safeLabels.length || !safeSeries.length) return "";
+        if (!safeLabels.length) return "";
+        const interactiveLegend = Array.isArray(rangeOptions?.seriesOptions);
+        const legendSeries = interactiveLegend
+            ? normalizeSeries(safeLabels, rangeOptions.seriesOptions)
+            : safeSeries;
 
         const left = 64;
         const chartWidth = 1000;
@@ -2262,9 +2271,12 @@
             : showPoints
               ? `${safeLabels.length} 个数据点`
               : `保留全部 ${safeLabels.length} 个数据点，已隐藏圆点标记以减少渲染`;
-        const chartSummary = `显示区间 ${safeLabels[0]} 至 ${safeLabels.at(-1)}；${densitySummary}；区间末值：${safeSeries
-            .map((item) => `${item.label} ${item.values.at(-1) || 0}`)
-            .join("，")}${rangeOptions?.note ? `；${rangeOptions.note}` : ""}`;
+        const seriesSummary = safeSeries.length
+            ? `区间末值：${safeSeries
+                  .map((item) => `${item.label} ${item.values.at(-1) || 0}`)
+                  .join("，")}`
+            : "当前未选择折线";
+        const chartSummary = `显示区间 ${safeLabels[0]} 至 ${safeLabels.at(-1)}；${densitySummary}；${seriesSummary}${rangeOptions?.note ? `；${rangeOptions.note}` : ""}`;
         const ariaLabel = `${title}；${chartSummary}`;
         const yAxisMarkup = `
             <line class="line-axis" x1="${left}" y1="${top}" x2="${left}" y2="${bottom}"></line>
@@ -2393,10 +2405,14 @@
               <div data-trend-main>
               <h4>${escapeHtml(title)}</h4>
               <div class="line-legend">
-                ${safeSeries
-                    .map(
-                        (item) => `<div class="line-legend-item"><svg class="line-legend-key" viewBox="0 0 28 8" aria-hidden="true"><line x1="1" y1="4" x2="27" y2="4" style="stroke:${CHART_COLORS[item.tone]};stroke-width:3;stroke-dasharray:${item.dash || "none"}"></line></svg><span>${escapeHtml(item.label)}</span><strong>${item.values.at(-1) || 0}</strong></div>`,
-                    )
+                ${legendSeries
+                    .map((item) => {
+                        const content = `<svg class="line-legend-key" viewBox="0 0 28 8" aria-hidden="true"><line x1="1" y1="4" x2="27" y2="4" style="stroke:${CHART_COLORS[item.tone]};stroke-width:3;stroke-dasharray:${item.dash || "none"}"></line></svg><span>${escapeHtml(item.label)}</span><strong>${item.values.at(-1) || 0}</strong>`;
+                        if (!interactiveLegend) {
+                            return `<div class="line-legend-item">${content}</div>`;
+                        }
+                        return `<label class="line-legend-item line-series-option" data-active="${item.active}"><input class="line-series-toggle" type="checkbox" data-trend-series="${escapeHtml(item.key)}" aria-label="显示 ${escapeHtml(item.label)} 折线" style="accent-color:${CHART_COLORS[item.tone]}"${item.active ? " checked" : ""}>${content}</label>`;
+                    })
                     .join("")}
               </div>
               <div class="chart-context">
@@ -2465,12 +2481,19 @@
         }
         let startIndex = recentMonthsStartIndex(labels);
         let endIndex = labels.length - 1;
+        const allSeries = config.series.map((item, index) => ({
+            ...item,
+            key: String(item.key || `series-${index}`),
+        }));
+        const activeSeries = new Set(allSeries.map((item) => item.key));
         const chartMarkup = (includeRange) => {
             const visibleLabels = labels.slice(startIndex, endIndex + 1);
-            const visibleSeries = config.series.map((item) => ({
+            const seriesOptions = allSeries.map((item) => ({
                 ...item,
                 values: item.values.slice(startIndex, endIndex + 1),
+                active: activeSeries.has(item.key),
             }));
+            const visibleSeries = seriesOptions.filter((item) => item.active);
             return lineChartMarkup(
                 config.title,
                 visibleLabels,
@@ -2480,12 +2503,15 @@
                 includeRange
                     ? {
                           fullLabels: labels,
-                          fullSeries: config.series,
+                          fullSeries: allSeries.filter((item) =>
+                              activeSeries.has(item.key),
+                          ),
                           startIndex,
                           endIndex,
                           note: config.note,
+                          seriesOptions,
                       }
-                    : { note: config.note },
+                    : { note: config.note, seriesOptions },
             );
         };
         const render = () => {
@@ -2579,6 +2605,17 @@
                     endIndex = labels.length - 1;
                     render();
                 });
+        };
+        container.onchange = (event) => {
+            const toggle = event.target.closest?.("[data-trend-series]");
+            if (!toggle) return;
+            const key = toggle.dataset.trendSeries;
+            if (toggle.checked) {
+                activeSeries.add(key);
+            } else {
+                activeSeries.delete(key);
+            }
+            render();
         };
         render();
     }
@@ -3698,6 +3735,10 @@
             .line-legend-item { display: inline-flex; align-items: center; gap: 6px; }
             .line-legend-key { flex: none; width: 28px; height: 8px; overflow: visible; }
             .line-legend-item strong { color: var(--text); font-size: 12px; }
+            .line-series-option { min-height: 30px; padding: 3px 7px; cursor: pointer; border: 1px solid var(--border); border-radius: 6px; }
+            .line-series-option[data-active="false"] { opacity: .55; }
+            .line-series-option:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+            .line-series-toggle { width: 14px; height: 14px; margin: 0; }
             .chart-context { display: flex; align-items: center; justify-content: space-between; gap: 8px 14px; flex-wrap: wrap; margin: 5px 0 7px; }
             .chart-summary { flex: 1 1 420px; margin: 0; color: var(--muted); line-height: 1.45; }
             .line-chart-card { grid-column: 1 / -1; }
@@ -3753,6 +3794,7 @@
               .trend-range-controls label, .trend-range-controls input[type="date"] { width: 100%; box-sizing: border-box; }
               .trend-range-controls input[type="date"], .trend-range-controls .button { min-height: 44px; }
               .trend-range-controls .button { grid-column: 1 / -1; }
+              .line-series-option { min-height: 44px; box-sizing: border-box; }
             }
           </style>
           <button id="launcher" aria-controls="panel" aria-expanded="false" hidden>仓库统计</button>

@@ -35,6 +35,8 @@ assert.match(userscriptSource, /pullRequestTrend: buildPullRequestTrend/);
 assert.match(userscriptSource, /data-trend-range="start"/);
 assert.match(userscriptSource, /range\.addEventListener\("input"/);
 assert.match(userscriptSource, /scheduleMainRender\(\)/);
+assert.match(userscriptSource, /container\.onchange = \(event\)/);
+assert.match(userscriptSource, /activeSeries\.delete\(key\)/);
 assert.match(userscriptSource, /dateInput\.addEventListener\("change"/);
 assert.match(userscriptSource, /本地筛选，不调用 API/);
 assert.match(userscriptSource, /ui\.panel\.setAttribute\("aria-busy"/);
@@ -257,6 +259,10 @@ assert.deepEqual(
     prTrend.series.map((series) => series.tone),
     ["green", "purple", "red"],
 );
+assert.deepEqual(
+    prTrend.series.map((series) => series.key),
+    ["open", "merge", "close"],
+);
 assert.equal(prTrend.series.every((series) => !series.dash), true);
 assert.match(prTrend.note, /每日收盘状态/);
 assert.deepEqual(
@@ -291,12 +297,19 @@ const lineMarkup = stats.lineChartMarkup(
         startIndex: 1,
         endIndex: 2,
         note: prTrend.note,
+        seriesOptions: prTrend.series.map((series) => ({
+            ...series,
+            values: series.values.slice(1),
+            active: true,
+        })),
     },
 );
 assert.match(lineMarkup, /class="line-chart"/);
 assert.match(lineMarkup, /data-daily-axis="true"/);
 assert.match(lineMarkup, /class="chart-summary"/);
 assert.match(lineMarkup, /class="line-legend-key"/);
+assert.equal((lineMarkup.match(/data-trend-series=/g) || []).length, 3);
+assert.equal((lineMarkup.match(/class="line-series-toggle"/g) || []).length, 3);
 assert.match(lineMarkup, /class="trend-range-panel"/);
 assert.match(lineMarkup, /data-trend-date="start"/);
 assert.match(lineMarkup, /data-trend-range="end"/);
@@ -323,6 +336,71 @@ assert.equal(
     ),
     1,
 );
+
+const reducedYAxisMarkup = stats.lineChartMarkup(
+    "单系列自动 Y 轴",
+    ["2026-01-01", "2026-01-02"],
+    [
+        {
+            key: "close",
+            label: "累计 Close PR（未合并）",
+            tone: "red",
+            values: [2, 4],
+        },
+    ],
+    "PR 数量",
+    true,
+    {
+        seriesOptions: [
+            {
+                key: "open",
+                label: "Open PR",
+                tone: "green",
+                values: [80, 100],
+                active: false,
+            },
+            {
+                key: "merge",
+                label: "累计 Merge PR",
+                tone: "purple",
+                values: [40, 60],
+                active: false,
+            },
+            {
+                key: "close",
+                label: "累计 Close PR（未合并）",
+                tone: "red",
+                values: [2, 4],
+                active: true,
+            },
+        ],
+    },
+);
+assert.match(reducedYAxisMarkup, />4<\/text>/);
+assert.doesNotMatch(reducedYAxisMarkup, />100<\/text>/);
+assert.match(
+    reducedYAxisMarkup,
+    /data-trend-series="close"[^>]* checked/,
+);
+assert.equal((reducedYAxisMarkup.match(/<polyline/g) || []).length, 1);
+
+const emptySeriesMarkup = stats.lineChartMarkup(
+    "全部关闭",
+    ["2026-01-01", "2026-01-02"],
+    [],
+    "PR 数量",
+    true,
+    {
+        seriesOptions: prTrend.series.map((series) => ({
+            ...series,
+            values: series.values.slice(0, 2),
+            active: false,
+        })),
+    },
+);
+assert.match(emptySeriesMarkup, /当前未选择折线/);
+assert.equal((emptySeriesMarkup.match(/data-trend-series=/g) || []).length, 3);
+assert.equal((emptySeriesMarkup.match(/<polyline/g) || []).length, 0);
 
 const detailedAxisMarkup = stats.lineChartMarkup(
     "详细坐标轴",
