@@ -37,6 +37,19 @@ assert.match(userscriptSource, /range\.addEventListener\("input"/);
 assert.match(userscriptSource, /dateInput\.addEventListener\("change"/);
 assert.match(userscriptSource, /本地筛选，不调用 API/);
 assert.match(userscriptSource, /ui\.panel\.setAttribute\("aria-busy"/);
+assert.match(userscriptSource, /id="check-token"/);
+assert.match(
+    userscriptSource,
+    /ui\.checkToken\.addEventListener\("click", refreshRateLimits\)/,
+);
+assert.match(
+    userscriptSource,
+    /async function saveToken\(\)[\s\S]*await fetchRateLimits\(token\)[\s\S]*GM_setValue\(TOKEN_KEY, token\)/,
+);
+assert.match(
+    userscriptSource,
+    /if \(isTokenAuthenticationError\(error\)\)[\s\S]*请重新配置 Token 后再分析[\s\S]*return;/,
+);
 assert.match(
     userscriptSource,
     /GitHub 实时额度复核失败；不使用本地累计值代替/,
@@ -52,6 +65,16 @@ assert.match(
 assert.doesNotMatch(
     userscriptSource,
     /HAN_PATTERN|classifyLanguage|summary\.(?:chinese|english)/,
+);
+assert.equal(
+    stats.isTokenAuthenticationError(
+        Object.assign(new Error("Bad credentials"), { status: 401 }),
+    ),
+    true,
+);
+assert.equal(
+    stats.isTokenAuthenticationError(new Error("502 Bad Gateway")),
+    false,
 );
 
 const pr = {
@@ -1151,6 +1174,23 @@ async function testRateLimitLookup() {
     );
 }
 
+async function testInvalidTokenLookup() {
+    global.GM_xmlhttpRequest = ({ onload }) => {
+        onload({
+            status: 401,
+            responseHeaders: "x-github-request-id: test-request\r\n",
+            responseText: JSON.stringify({ message: "Bad credentials" }),
+        });
+    };
+
+    await assert.rejects(stats.fetchRateLimits("invalid-token"), (error) => {
+        assert.equal(error.status, 401);
+        assert.equal(stats.isTokenAuthenticationError(error), true);
+        assert.match(error.message, /Bad credentials/);
+        return true;
+    });
+}
+
 testSeparatedLocalAnalysis()
     .then(testAllHistorySplitsPullsAndIssues)
     .then(testGraphqlErrorDetails)
@@ -1161,6 +1201,7 @@ testSeparatedLocalAnalysis()
     .then(testGraphqlRetriesAtMinimumPageSize)
     .then(testPageSizeDropsAndRecoversByTen)
     .then(testRateLimitLookup)
+    .then(testInvalidTokenLookup)
     .then(() => console.log("github_pr_statistics tests passed"))
     .catch((error) => {
         console.error(error);

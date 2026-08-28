@@ -2,7 +2,7 @@
 // @name         GitHub 仓库贡献统计
 // @name:en      GitHub Repository Contribution Statistics
 // @namespace    https://github.com/aik4o
-// @version      0.6.20
+// @version      0.6.21
 // @description  低 API 成本统计仓库的 PR、Issue、贡献者与 Commit 活跃度
 // @description:en Low-cost PR, issue, contributor, and commit activity statistics
 // @match        https://github.com/*/*
@@ -22,7 +22,7 @@
     const OPTIONS_KEY = "github-pr-statistics-options-v1";
     const CHECKPOINT_KEY = "github-pr-statistics-checkpoint-v1";
     const CHECKPOINT_VERSION = 1;
-    const SCRIPT_VERSION = "0.6.20";
+    const SCRIPT_VERSION = "0.6.21";
     const DEFAULT_OPTIONS = Object.freeze({
         includeIssues: true,
         includeCommits: true,
@@ -159,6 +159,7 @@
     let analyzedScope = null;
     let analyzedOptions = null;
     let loading = false;
+    let checkingToken = false;
     let pauseRequested = false;
     let fetchCheckpoint = null;
     let lastRateLimits = { graphql: null, rest: null };
@@ -1031,6 +1032,21 @@
         );
     }
 
+    function isTokenAuthenticationError(error) {
+        return (
+            Number(error?.status) === 401 ||
+            /\bBad credentials\b/i.test(
+                String(error?.message || error || ""),
+            )
+        );
+    }
+
+    function formatTokenCheckError(error) {
+        return isTokenAuthenticationError(error)
+            ? "Token 无效、已过期或已被撤销（GitHub 返回 401 Bad credentials）"
+            : `无法完成 Token 检查；${error?.message || String(error)}`;
+    }
+
     function createPauseError() {
         const error = new Error("用户已暂停读取");
         error.paused = true;
@@ -1222,15 +1238,15 @@
                         }
                     }
                     if (!acceptedStatuses.includes(response.status)) {
-                        reject(
-                            new Error(
-                                formatApiError(
-                                    payload?.message ||
-                                        `GitHub REST API 请求失败 (${response.status})`,
-                                    response,
-                                ),
+                        const error = new Error(
+                            formatApiError(
+                                payload?.message ||
+                                    `GitHub REST API 请求失败 (${response.status})`,
+                                response,
                             ),
                         );
+                        error.status = response.status;
+                        reject(error);
                         return;
                     }
                     if (
@@ -3019,6 +3035,9 @@
         ui.pause.disabled = !value || pauseRequested;
         if (!value) ui.pause.textContent = "暂停";
         ui.refreshRateLimits.disabled = value;
+        ui.saveToken.disabled = value;
+        ui.checkToken.disabled = value;
+        ui.clearToken.disabled = value;
         ui.scopeAll.disabled = value;
         ui.scopeOpen.disabled = value;
         ui.includeIssues.disabled = value;
@@ -3094,30 +3113,33 @@
     }
 
     async function refreshRateLimits() {
-        if (loading) return;
+        if (loading || checkingToken) return;
         const token = String(GM_getValue(TOKEN_KEY, "")).trim();
         if (!token) {
             ui.settings.open = true;
             setStatus("请先在 Token 设置中保存 GitHub Token", "error");
             return;
         }
-        ui.refreshRateLimits.disabled = true;
-        ui.analyze.disabled = true;
+        setTokenChecking(true);
+        updateTokenState("checking");
         setStatus("正在通过 GitHub /rate_limit 查询额度…");
         try {
             lastRateLimits = await fetchRateLimits(token);
+            updateTokenState("valid");
             setStatus(
-                `GitHub 实时额度查询完成（不消耗 REST 主额度）；${formatRateLimits()}`,
+                `Token 配置正确；GitHub 实时额度查询完成（不消耗 REST 主额度）；${formatRateLimits()}`,
                 "success",
             );
         } catch (error) {
-            setStatus(
-                `额度查询失败；${error.message || String(error)}`,
-                "error",
-            );
+            if (isTokenAuthenticationError(error)) {
+                updateTokenState("invalid");
+                ui.settings.open = true;
+            } else {
+                updateTokenState("unchecked");
+            }
+            setStatus(formatTokenCheckError(error), "error");
         } finally {
-            ui.refreshRateLimits.disabled = false;
-            ui.analyze.disabled = false;
+            setTokenChecking(false);
         }
     }
 
@@ -3182,10 +3204,22 @@
         try {
             baselineRateLimits = await fetchRateLimits(token);
             lastRateLimits = baselineRateLimits;
+            updateTokenState("valid");
             setStatus(
                 `读取前额度基线（通过 /rate_limit 查询，不消耗 REST 主额度）；${formatRateLimits(baselineRateLimits)}`,
             );
         } catch (error) {
+            if (isTokenAuthenticationError(error)) {
+                updateTokenState("invalid");
+                ui.settings.open = true;
+                setProgress(0, "Token 验证失败");
+                setStatus(
+                    `${formatTokenCheckError(error)}；请重新配置 Token 后再分析`,
+                    "error",
+                );
+                setLoading(false);
+                return;
+            }
             setStatus(
                 `读取前额度查询失败，继续读取；${error.message || String(error)}`,
             );
@@ -3358,34 +3392,68 @@
         setStatus("统计原始数据与派生指标已导出为 JSON", "success");
     }
 
-    function saveToken() {
+    function setTokenChecking(value) {
+        checkingToken = value;
+        ui.saveToken.disabled = value;
+        ui.checkToken.disabled = value;
+        ui.clearToken.disabled = value;
+        ui.analyze.disabled = value;
+        ui.refreshRateLimits.disabled = value;
+    }
+
+    async function saveToken() {
+        if (loading || checkingToken) return;
         const token = ui.token.value.trim();
         if (!token) {
             setStatus("Token 不能为空；如需删除请点击“清除 Token”", "error");
             return;
         }
-        clearFetchCheckpoint();
-        GM_setValue(TOKEN_KEY, token);
-        ui.token.value = "";
-        ui.settings.open = false;
-        updateTokenState();
-        setStatus("Token 已保存；请选择分析选项，然后点击“开始分析”", "success");
+        setTokenChecking(true);
+        updateTokenState("checking");
+        setStatus("正在验证 Token；验证成功后才会保存…");
+        try {
+            lastRateLimits = await fetchRateLimits(token);
+            GM_setValue(TOKEN_KEY, token);
+            ui.token.value = "";
+            ui.settings.open = false;
+            updateTokenState("valid");
+            setStatus(
+                `Token 验证成功并已保存；${formatRateLimits()}`,
+                "success",
+            );
+        } catch (error) {
+            updateTokenState();
+            setStatus(
+                `${formatTokenCheckError(error)}；未保存输入的 Token`,
+                "error",
+            );
+        } finally {
+            setTokenChecking(false);
+        }
     }
 
     function clearToken() {
-        clearFetchCheckpoint();
         GM_deleteValue(TOKEN_KEY);
         ui.token.value = "";
         updateTokenState();
         setStatus("Token 已清除");
     }
 
-    function updateTokenState() {
+    function updateTokenState(state = "unchecked") {
         const configured = Boolean(
             String(GM_getValue(TOKEN_KEY, "")).trim(),
         );
-        ui.tokenState.textContent = configured ? "已配置" : "未配置";
+        if (!configured && state !== "checking") state = "missing";
+        const labels = {
+            missing: "未配置",
+            unchecked: "已配置，未检查",
+            checking: "检查中…",
+            valid: "有效",
+            invalid: "无效",
+        };
+        ui.tokenState.textContent = labels[state] || labels.unchecked;
         ui.tokenState.dataset.configured = String(configured);
+        ui.tokenState.dataset.state = state;
     }
 
     function createUi() {
@@ -3571,7 +3639,8 @@
             details { margin-top: 12px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; }
             details.table-details { margin-top: 10px; }
             summary { cursor: pointer; font-weight: 600; }
-            #token-state[data-configured="true"] { color: var(--chart-green); }
+            #token-state[data-state="valid"] { color: var(--chart-green); }
+            #token-state[data-state="invalid"] { color: var(--chart-red); }
             .token-row { display: flex; gap: 7px; margin-top: 10px; }
             #token { flex: 1; min-width: 160px; padding: 6px 8px; color: var(--text); background: var(--panel-bg); border: 1px solid var(--border); border-radius: 6px; }
             .help { margin: 8px 0 0; color: var(--muted); line-height: 1.5; }
@@ -3651,7 +3720,8 @@
                 <summary>GitHub Token 设置（<span id="token-state">未配置</span>）</summary>
                 <div class="token-row">
                   <input id="token" type="password" autocomplete="off" placeholder="github_pat_… 或 ghp_…">
-                  <button id="save-token" class="button">保存</button>
+                  <button id="save-token" class="button">验证并保存</button>
+                  <button id="check-token" class="button">检查 Token</button>
                   <button id="clear-token" class="button">清除 Token</button>
                 </div>
                 <p class="help">
@@ -3712,6 +3782,7 @@
             tokenState: get("#token-state"),
             token: get("#token"),
             saveToken: get("#save-token"),
+            checkToken: get("#check-token"),
             clearToken: get("#clear-token"),
         };
 
@@ -3750,6 +3821,7 @@
         ui.scopeAll.addEventListener("click", () => setScope("all"));
         ui.scopeOpen.addEventListener("click", () => setScope("open"));
         ui.saveToken.addEventListener("click", saveToken);
+        ui.checkToken.addEventListener("click", refreshRateLimits);
         ui.clearToken.addEventListener("click", clearToken);
         for (const input of [
             ui.includeIssues,
@@ -3876,6 +3948,7 @@
             fetchRateLimits,
             formatRateLimit,
             formatRateLimitChange,
+            isTokenAuthenticationError,
             lineChartMarkup,
             normalizeRestComment,
             normalizeRestReview,
