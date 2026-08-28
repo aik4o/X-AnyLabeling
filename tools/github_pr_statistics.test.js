@@ -224,11 +224,13 @@ const prTrend = stats.buildPullRequestTrend(
     "all",
 );
 assert.deepEqual(prTrend.labels, ["2026-01-01", "2026-01-02", "2026-01-03"]);
-assert.deepEqual(prTrend.series[0].values, [2, 0, 1]);
-assert.deepEqual(prTrend.series[1].values, [1, 0, 1]);
-assert.deepEqual(prTrend.series[2].values, [2, 0, 0]);
-assert.deepEqual(prTrend.series[3].values, [1, 0, 1]);
-assert.deepEqual(prTrend.series[4].values, [0, 0, 1]);
+assert.deepEqual(prTrend.series[0].values, [2, 2, 3]);
+assert.deepEqual(prTrend.series[1].values, [2, 2, 2]);
+assert.deepEqual(prTrend.series[2].values, [2, 2, 2]);
+assert.deepEqual(prTrend.series[3].values, [2, 2, 2]);
+assert.deepEqual(prTrend.series[4].values, [1, 1, 1]);
+assert.equal(prTrend.series[0].reference, undefined);
+assert.equal(prTrend.series.slice(1).every((series) => series.reference), true);
 assert.deepEqual(
     stats.buildPullRequestTrend(
         [
@@ -247,7 +249,7 @@ assert.deepEqual(
 );
 
 const lineMarkup = stats.lineChartMarkup(
-    "PR 每日趋势（按创建日期）",
+    "PR 累计趋势与当前统计横线（按创建日期）",
     prTrend.labels,
     prTrend.series,
     "PR 数量",
@@ -255,7 +257,10 @@ const lineMarkup = stats.lineChartMarkup(
 );
 assert.match(lineMarkup, /class="line-chart"/);
 assert.match(lineMarkup, /data-daily-axis="true"/);
-assert.equal((lineMarkup.match(/<polyline/g) || []).length, 5);
+assert.match(lineMarkup, /class="line-y-axis-sticky"/);
+assert.doesNotMatch(lineMarkup, /line-grid/);
+assert.equal((lineMarkup.match(/<polyline/g) || []).length, 1);
+assert.equal((lineMarkup.match(/line-path line-reference/g) || []).length, 4);
 for (const tone of ["blue", "purple", "green", "orange", "red"]) {
     assert.match(lineMarkup, new RegExp(`tone-${tone}`));
 }
@@ -309,7 +314,7 @@ assert.equal(
     181,
 );
 assert.match(longDailyMarkup, /style="width:5840px;max-width:none"/);
-assert.equal((lineMarkup.match(/<circle/g) || []).length, 15);
+assert.equal((lineMarkup.match(/<circle/g) || []).length, 3);
 
 async function testSeparatedLocalAnalysis() {
     const progress = [];
